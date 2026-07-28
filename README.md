@@ -7,13 +7,15 @@ Backpropping feature constraints through ReLU networks to input spaces.
 From GitHub:
 
 ```bash
-pip install git+https://github.com/<your-username>/lat_space_lens.git
+pip install git+https://github.com/RyanRTJJ/lat_space_lens.git
 ```
 
 Locally, for development:
 
 ```bash
-pip install -e /Users/ryan.tan/Documents/lat_space_lens
+git clone https://github.com/RyanRTJJ/lat_space_lens.git
+cd lat_space_lens
+pip install -e .
 ```
 
 ## Use
