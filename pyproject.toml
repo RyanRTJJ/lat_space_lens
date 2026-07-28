@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lat-space-lens"
+version = "0.1.0"
+description = "Backpropping feature constraints to input spaces"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Ryan Tan", email = "ryan.rtjj@gmail.com" }]
+dependencies = [
+    "cvxpy",
+    "joblib",
+    "numpy",
+    "scipy",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lat_space_lens"]
