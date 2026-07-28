@@ -18,6 +18,25 @@ cd lat_space_lens
 pip install -e .
 ```
 
+## Updating
+
+A `git+` install snapshots the code at install time; it does not track the
+repo. To pick up newer commits:
+
+```bash
+pip install --upgrade --force-reinstall git+https://github.com/RyanRTJJ/lat_space_lens.git
+```
+
+`--force-reinstall` is needed because pip will otherwise consider the
+requirement already satisfied whenever the version string hasn't changed.
+
+For reproducible installs, pin to a tag (or a commit hash) rather than
+tracking the default branch:
+
+```bash
+pip install "git+https://github.com/RyanRTJJ/lat_space_lens.git@v0.1.0"
+```
+
 ## Use
 
 ```python
