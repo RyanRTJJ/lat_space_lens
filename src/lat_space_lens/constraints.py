@@ -542,6 +542,45 @@ class ConstraintSet:
         print(f'Regions produced this set: {len(zeroed_dim_idxs_to_constraint_sets)} / {2 ** d_large}\n')
         return zeroed_dim_idxs_to_constraint_sets
 
+    def reverse_add_relu(
+            self,
+            W: np.ndarray,
+            M: np.ndarray,
+            bias: np.ndarray,
+    ) -> dict[tuple, 'ConstraintSet']:
+        """
+        Same as reverse_relu, but for a relu whose pre-activation is fed by TWO
+        branches instead of one:
+
+            p = W @ x + M @ y + bias        (pre-activation)
+            z = ReLU(p)                     (post-activation)
+
+        `y` is treated as FREE, and the answer is over the joint variable
+        [x; y]. This is a relaxation if y is itself a function of x upstream.
+
+        The orthant enumeration is completely untouched by the extra branch:
+        it happens in p-space (width d_large), which does not know about x or
+        y at all. The ONLY thing that changes is the equality constraint. The
+        achievable p live on the affine set bias + span([W M]), so with
+        N = null_space([W M].T):
+
+            N.T @ p = N.T @ (W @ x + M @ y + bias) = N.T @ bias
+
+        i.e. A_eq = N.T and b_eq = A_eq @ bias, same expression as the
+        single-branch case with [W M] substituted for W. So we can defer to
+        reverse_relu on the stacked matrix outright.
+
+        @param W:       shape (d_large, d_x)
+        @param M:       shape (d_large, d_y)
+
+        @return:        dict of zeroed_dim_idxs to ConstraintSet, in p-space
+                        (width d_large). Feed these to reverse_add_up_proj to
+                        land in joint [x; y] space.
+        """
+        assert W.shape[0] == M.shape[0], \
+            f'W and M must agree on d_large, got {W.shape[0]} and {M.shape[0]}'
+        return self.reverse_relu(np.hstack([W, M]), bias)
+
     def reverse_up_proj(self, W: np.ndarray, bias: np.ndarray):
         """
         This is supposed to be easy (entirely linear). You have (math convention):
@@ -578,6 +617,27 @@ class ConstraintSet:
             A_eq=new_A_eq,
             b_eq=new_b_eq,
         )
+
+    def reverse_add_up_proj(self, W: np.ndarray, M: np.ndarray, bias: np.ndarray):
+        """
+        The substitution step for the two-branch case: takes constraints on the
+        pre-activation p and rewrites them over the joint variable [x; y].
+
+        -   pre-activation:     p = W @ x + M @ y + bias
+        -   constraint on p:    A @ p > b
+
+        =>  A @ (W @ x + M @ y) + A @ bias > b
+        =>  A @ [W M] @ [x; y] > b - A @ bias
+
+        which is reverse_up_proj on the stacked matrix. The resulting
+        ConstraintSet has width d_x + d_y, with the x block FIRST.
+
+        @param W:       shape (d_large, d_x)
+        @param M:       shape (d_large, d_y)
+        """
+        assert W.shape[0] == M.shape[0], \
+            f'W and M must agree on d_large, got {W.shape[0]} and {M.shape[0]}'
+        return self.reverse_up_proj(np.hstack([W, M]), bias)
 
     def reverse_down_proj(self, W: np.ndarray, bias: np.ndarray) -> "ConstraintSet":
         """
