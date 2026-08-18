@@ -99,7 +99,13 @@ def _plot_region_2d(ax, region: ConstraintSet, plot_z: int, color, alpha: float)
     ax.fill(vertices_closed[:, 0], vertices_closed[:, 1], color=color, alpha=alpha)
 
 
-def _plot_region_3d(ax, region: ConstraintSet, plot_z: int, color, alpha: float):
+def _plot_region_3d(
+        ax,
+        region: ConstraintSet,
+        plot_z: int,
+        color,
+        alpha: float,
+):
     """
     Plots the polyhedron region.A @ x >= region.b intersected with the
     [-plot_z, plot_z]^3 cube, face by face (`ax` must have

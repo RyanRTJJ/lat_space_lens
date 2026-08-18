@@ -10,7 +10,41 @@ import time
 import cvxpy as cp
 import joblib
 import numpy as np
+from scipy.linalg import block_diag
 from scipy.linalg import null_space
+
+
+# cvxpy's default solver is accurate on these feasibility LPs but occasionally
+# dies outright on a badly conditioned one -- the regions coming out of a deep
+# reversal can have condition numbers around 1e16, since each step multiplies
+# more weight matrices together. SCIPY (HiGHS) is a dedicated LP solver and was
+# measured to agree with the default on every problem the default managed to
+# solve, so it is the fallback.
+#
+# SCS is deliberately NOT here. Being first-order it is far too loose on these
+# degenerate problems: on one such batch it called 654 of 1280 regions feasible
+# where both CLARABEL and HiGHS said 118.
+_SOLVER_FALLBACKS = tuple(
+    solver for solver in ('SCIPY',) if solver in cp.installed_solvers()
+)
+
+
+def _solve_or_fall_back(problem: cp.Problem) -> None:
+    """
+    Solves in place, trying the fallback solvers if the default one errors out.
+    Re-raises the original error if none of them get anywhere either.
+    """
+    try:
+        problem.solve()
+        return
+    except cp.error.SolverError as default_solver_error:
+        for solver in _SOLVER_FALLBACKS:
+            try:
+                problem.solve(solver=solver)
+                return
+            except cp.error.SolverError:
+                continue
+        raise default_solver_error
 
 
 class ConstraintSet:
@@ -21,6 +55,27 @@ class ConstraintSet:
     inequalities look like this in matrix form:
     A @ x >= | > b
     we represent them with self.A, self.b, and self.inequality
+
+    BLOCK STRUCTURE (self.block_sizes)
+    ----------------------------------
+    Once a layer INJECTS a variable that did not come from earlier layers
+    (see reverse_add_relu), the variable this constraint set is written over
+    stops being a single homogeneous vector and becomes a concatenation:
+
+        [ active | y_earliest | ... | y_latest ]
+
+    self.block_sizes records those widths, and it always sums to
+    self.A.shape[1]. The invariant is:
+
+    -   block_sizes[0] is the ACTIVE block: the only part still being
+        reverse-propagated. Every reverse_* method transforms this block and
+        this block only.
+    -   Everything after it is frozen injected input. It is carried through
+        each reversal untouched, and each new injection inserts its block at
+        position 1, so the suffix ends up ordered earliest-layer-first.
+
+    With no injections this is just [A.shape[1]] and every method behaves
+    exactly as it did before block_sizes existed.
     """
     GEQ = '>='
     GE = '>'
@@ -102,6 +157,8 @@ class ConstraintSet:
             format_numpy_array(self.b_eq) + '\n'
 
         to_print += \
+            '+------------------------\n' + \
+            f'| block_sizes: {self.block_sizes}\n' + \
             '+=======================================+\n'
 
         return to_print
@@ -113,6 +170,7 @@ class ConstraintSet:
             inequalities: list[str] | str | None = None,
             A_eq: np.ndarray | None = None,
             b_eq: np.ndarray | float | None = None,
+            block_sizes: list[int] | None = None,
     ):
         # Everything should be given or None
         assert (
@@ -147,44 +205,79 @@ class ConstraintSet:
         self.A_eq = A_eq
         self.b_eq = b_eq
 
+        # A_eq is applied to the same variable as A (see is_feasible, which
+        # builds ONE cp.Variable for both), so a width mismatch is a bug that
+        # would otherwise only surface at solve time.
+        if isinstance(self.A, np.ndarray) and isinstance(self.A_eq, np.ndarray):
+            assert self.A_eq.shape[1] == self.A.shape[1], \
+                f'A_eq width {self.A_eq.shape[1]} does not match A width {self.A.shape[1]}'
+
+        if isinstance(self.A, np.ndarray):
+            if block_sizes is None:
+                block_sizes = [self.A.shape[1]]
+            assert all(size > 0 for size in block_sizes), \
+                f'block_sizes must all be positive, got {block_sizes}'
+            assert sum(block_sizes) == self.A.shape[1], \
+                f'block_sizes {block_sizes} must sum to A width {self.A.shape[1]}'
+            self.block_sizes = list(block_sizes)
+        else:
+            assert block_sizes is None, 'block_sizes given but there are no constraints'
+            self.block_sizes = None
+
+    def __setstate__(self, state):
+        """
+        Back-compat for ConstraintSets pickled before block_sizes existed
+        (save_to_pkl / load_from_pkl, and anything already sitting on disk or
+        in flight between machines). An un-blocked set is a single block.
+        """
+        self.__dict__.update(state)
+        if 'block_sizes' not in state:
+            self.block_sizes = \
+                [self.A.shape[1]] if isinstance(self.A, np.ndarray) else None
+
+    @property
+    def d_active(self) -> int:
+        """
+        Width of the block still being reverse-propagated.
+        """
+        assert self.block_sizes is not None, 'No constraints defined'
+        return self.block_sizes[0]
+
+    @property
+    def d_suffix(self) -> int:
+        """
+        Total width of the frozen injected blocks trailing the active one.
+        """
+        return sum(self.block_sizes[1:])
+
+    def _carry_suffix(self, W: np.ndarray, bias: np.ndarray):
+        """
+        Lifts a map on the ACTIVE block alone to a map on the whole variable,
+        leaving the injected suffix untouched:
+
+            [active; y] = [[W, 0], [0, I]] @ [new_active; y] + [bias; 0]
+
+        so that self.A @ W_full == [A_active @ W | A_y], which is exactly the
+        block-wise substitution. With no suffix this returns W and bias
+        unchanged.
+        """
+        assert W.shape[0] == self.d_active, \
+            f'W maps from the active block, so expected {self.d_active} rows, got {W.shape[0]}'
+        assert bias.shape[0] == self.d_active, \
+            f'bias applies to the active block, so expected {self.d_active}, got {bias.shape[0]}'
+
+        d_suffix = self.d_suffix
+        if d_suffix == 0:
+            return W, bias
+
+        W_full = block_diag(W, np.eye(d_suffix))
+        bias_full = np.concatenate([bias, np.zeros(d_suffix)])
+        return W_full, bias_full
+
     @staticmethod
     def power_set(n: int):
         elements = range(n)
         return [list(combo) for r in range(n + 1) for combo in combinations(elements, r)]
-
-    def add_constraints(
-            self,
-            A: np.ndarray,
-            b: np.ndarray,
-            inequalities: list[str] | str | None = None,
-            is_inequality: bool = True,
-    ):
-        A, b, inequalities = self._enforce_correct_shapes(
-            A,
-            b,
-            inequalities,
-            is_inequality=is_inequality
-        )
-        dim = A.shape[1]
-
-        if is_inequality:
-            if isinstance(self.A, np.ndarray):
-                assert dim == self.A.shape[1], f'`A` dim {dim} does not match existing'
-                self.A = np.hstack([self.A, A])
-                self.b = np.concatenate([self.b, b])
-                self.inequalities += inequalities
-            else:
-                self.A = A
-                self.b = b
-                self.inequalities = inequalities
-        else:
-            if isinstance(self.A_eq, np.ndarray):
-                assert dim == self.A_eq.shape[1], f'`A_eq` dim {dim} does not match existing'
-                self.A_eq = np.hstack([self.A_eq, A])
-                self.b_eq = np.concatenate([self.b_eq, b])
-            else:
-                self.A = A
-                self.b = b
 
     @staticmethod
     def dedupe_constraints(A, b, inequalities):
@@ -219,7 +312,7 @@ class ConstraintSet:
                 max_b_idx[group] = i
 
         keep = sorted(max_b_idx)
-        inequalities_to_keep = [inequalities[i] for i in max_b_idx]
+        inequalities_to_keep = [inequalities[i] for i in keep]
         return A[keep], b[keep], inequalities_to_keep
 
     def is_feasible(self) -> bool:
@@ -238,7 +331,7 @@ class ConstraintSet:
         # Dummy objective: minimize zero
         problem = cp.Problem(cp.Minimize(0), constraints)
 
-        problem.solve()
+        _solve_or_fall_back(problem)
 
         # Check feasibility
         if problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
@@ -266,7 +359,7 @@ class ConstraintSet:
             constraints += [self.A_eq @ x == self.b_eq]
 
         problem = cp.Problem(cp.Maximize(delta), constraints)
-        problem.solve()
+        _solve_or_fall_back(problem)
 
         if problem.status == cp.UNBOUNDED:
             # Infinite, basically
@@ -311,7 +404,7 @@ class ConstraintSet:
                 # Check if constraint i is redundant
                 objective = cp.Minimize(self.A[i] @ x - self.b[i])
                 problem = cp.Problem(objective, constraints)
-                problem.solve()
+                _solve_or_fall_back(problem)
 
                 # If minimum value >= -epsilon, constraint i is redundant
                 if problem.status == cp.OPTIMAL and problem.value >= -1e-6:
@@ -337,28 +430,43 @@ class ConstraintSet:
 
     def reverse_relu_for_Z_tuple(
             self,
-            relu_dim: int,
+            d_active: int,
             zeroed_dim_idxs: list[int],
             z_to_leq_zero_constraint: dict[int, str],
             A_eq: np.ndarray,
             b_eq: np.ndarray,
+            total_width: int | None = None,
     ):
         """
         Helper function to compute the pre-relu image in a particular orthant
         described by zeroed_dim_idxs. Remember that relu is ReLU(W @ x + bias).
 
-        @param zeroed_dim_idxs:             The orthant of interest is negative in these dims
+        The relu acts on the ACTIVE block only, so the orthant enumeration runs
+        over the first d_active dims while every constraint is still written at
+        full width. Building the cone constraints from np.eye(total_width) and
+        selecting rows from the active block gives the zero-padding across the
+        injected suffix for free.
+
+        @param d_active:                    Width of the block the relu acts on
+        @param zeroed_dim_idxs:             The orthant of interest is negative in these dims.
+                                            Indices into the ACTIVE block.
         @param z_to_leq_zero_constraint:    A cached mapping of if the hyperplane W @ x + bias
                                             (varies in z) or (does not vary but is negative in z)
-        @param A_eq:                        The normal form equation of W @ x + bias
+        @param A_eq:                        The normal form equation of W @ x + bias, already
+                                            padded out to total_width
         @param b_eq:                        The normal form equation of W @ x + bias
+        @param total_width:                 Full variable width. Defaults to d_active, i.e. the
+                                            un-blocked case.
 
         @return:                            (ConstraintSet | None)
         """
         TOL = 1e-10
 
+        if total_width is None:
+            total_width = d_active
+
         Z = np.array(zeroed_dim_idxs)
-        positive_dim_idxs = [i for i in range(relu_dim) if i not in zeroed_dim_idxs]
+        positive_dim_idxs = [i for i in range(d_active) if i not in zeroed_dim_idxs]
         F = np.array(positive_dim_idxs)
 
         # Does the plane even have a satisfiable region?
@@ -390,11 +498,11 @@ class ConstraintSet:
         # Delete all null rows
         null_row_idxs = np.argwhere(row_norms < TOL)
         keep_row_idxs = np.array([i for i in range(len(A_altered)) if i not in null_row_idxs])
-        if len(keep_row_idxs > 0):
+        if len(keep_row_idxs) > 0:
             A_altered = A_altered[keep_row_idxs]
             b_altered = b_altered[keep_row_idxs]
         else:
-            A_altered = np.empty(shape=(0, relu_dim))
+            A_altered = np.empty(shape=(0, total_width))
             b_altered = np.empty(shape=(0,))
 
         # Then, we need to compute the unrelu-ing of this. This means combining:
@@ -403,19 +511,19 @@ class ConstraintSet:
         #   3. A_altered @ x >= self.b (existing constraints, intersect with Z axial hyperplane)
         #   4. Must be on plane W @ x + bias. Assume bias = 0 for now
         if len(F) == 0:
-            A_F = np.empty(shape=(0, relu_dim))
+            A_F = np.empty(shape=(0, total_width))
             b_F = np.empty(shape=(0,))
         else:
-            A_F = np.eye(relu_dim)[F,:]
-            b_F = np.zeros_like(F)
+            A_F = np.eye(total_width)[F,:]
+            b_F = np.zeros(len(F))
         inequalities_F = [ConstraintSet.GEQ] * len(F)
 
         if len(Z) == 0:
-            A_Z = np.empty(shape=(0, relu_dim))
+            A_Z = np.empty(shape=(0, total_width))
             b_Z = np.empty(shape=(0,))
         else:
-            A_Z = -np.eye(relu_dim)[Z,:]
-            b_Z = np.zeros_like(Z)
+            A_Z = -np.eye(total_width)[Z,:]
+            b_Z = np.zeros(len(Z))
         inequalities_Z = [ConstraintSet.GEQ] * len(Z)
 
         A_combined = np.vstack([
@@ -437,7 +545,9 @@ class ConstraintSet:
             b=b_deduped,
             inequalities=inequalities_deduped,
             A_eq=A_eq,
-            b_eq=b_eq
+            b_eq=b_eq,
+            # Still in pre-activation space: same widths, same layout
+            block_sizes=self.block_sizes,
         )
 
         # It could be unfeasible now even if the hyperplane passed the
@@ -487,6 +597,12 @@ class ConstraintSet:
         d_large, _ = W.shape
         assert bias.shape[0] == d_large, 'Check your W and bias dims. They need to match.'
 
+        # The relu acts on the active block only; the injected suffix rides along.
+        total_width = self.A.shape[1]
+        assert d_large == self.d_active, \
+            f'relu acts on the active block, so expected W to have {self.d_active} rows, ' \
+            f'got {d_large}'
+
         dim_combos_for_zeroed_surfaces = self.power_set(d_large)
 
         # First, figure out which dimensions in which W is being meaningfully unrelued
@@ -504,8 +620,14 @@ class ConstraintSet:
             A_eq = None
             b_eq = None
         else:
-            # Find a particular solution to test for negativity
+            # Find a particular solution to test for negativity. Do this BEFORE
+            # padding, while A_eq is still square with the relu's own dims.
             x_particular = np.linalg.lstsq(A_eq, b_eq, rcond=None)[0]
+
+            # The equation of the plane constrains the active block only, so
+            # widen it with zeros over the injected suffix. b_eq is unchanged.
+            if total_width > d_large:
+                A_eq = np.hstack([A_eq, np.zeros((A_eq.shape[0], total_width - d_large))])
 
         for z in range(d_large):
             if not isinstance(A_eq, np.ndarray):
@@ -532,6 +654,7 @@ class ConstraintSet:
                 z_to_leq_zero_constraint,
                 A_eq,
                 b_eq,
+                total_width=total_width,
             )
             if potential_region:
                 zeroed_dim_idxs_to_constraint_sets[Z_tuple] = potential_region
@@ -584,7 +707,7 @@ class ConstraintSet:
     def reverse_up_proj(self, W: np.ndarray, bias: np.ndarray):
         """
         This is supposed to be easy (entirely linear). You have (math convention):
-        -   post-down-proj:             h = W @ x + bias
+        -   post-up-proj:               h = W @ x + bias
         -   post-up-proj constraint:    A @ h > b
         -   post-up-proj eq constraint: A_eq @ h == b_eq
 
@@ -600,15 +723,13 @@ class ConstraintSet:
         """
         assert isinstance(self.A, np.ndarray), 'No constraints to reverse'
 
-        new_A = self.A @ W
-        new_B = self.b - self.A @ bias
+        W_full, bias_full = self._carry_suffix(W, bias)
+
+        new_A = self.A @ W_full
+        new_B = self.b - self.A @ bias_full
 
         new_A_eq = None
         new_b_eq = None
-
-        # if (not drop_eq) and isinstance(self.A_eq, np.ndarray):
-        #     new_A_eq = self.A_eq @ W
-        #     new_b_eq = self.b_eq - self.A_eq @ bias
 
         return ConstraintSet(
             A=new_A,
@@ -616,6 +737,7 @@ class ConstraintSet:
             inequalities=self.inequalities,
             A_eq=new_A_eq,
             b_eq=new_b_eq,
+            block_sizes=[W.shape[1]] + self.block_sizes[1:],
         )
 
     def reverse_add_up_proj(self, W: np.ndarray, M: np.ndarray, bias: np.ndarray):
@@ -629,22 +751,33 @@ class ConstraintSet:
         =>  A @ (W @ x + M @ y) + A @ bias > b
         =>  A @ [W M] @ [x; y] > b - A @ bias
 
-        which is reverse_up_proj on the stacked matrix. The resulting
-        ConstraintSet has width d_x + d_y, with the x block FIRST.
+        which is reverse_up_proj on the stacked matrix. The active block, width
+        d_large, is replaced by TWO blocks, [d_x, d_y], with the x block first;
+        any already-injected suffix is carried along behind them.
+
+        The new y block is inserted at position 1 rather than appended, so that
+        walking further back through the network leaves the suffix ordered
+        earliest-injecting-layer first:
+
+            [u, y_earliest, ..., y_latest]
 
         @param W:       shape (d_large, d_x)
         @param M:       shape (d_large, d_y)
         """
         assert W.shape[0] == M.shape[0], \
             f'W and M must agree on d_large, got {W.shape[0]} and {M.shape[0]}'
-        return self.reverse_up_proj(np.hstack([W, M]), bias)
+
+        carried_blocks = self.block_sizes[1:]
+        region = self.reverse_up_proj(np.hstack([W, M]), bias)
+        region.block_sizes = [W.shape[1], M.shape[1]] + carried_blocks
+        return region
 
     def reverse_down_proj(self, W: np.ndarray, bias: np.ndarray) -> "ConstraintSet":
         """
         This is supposed to be easy (entirely linear). You have (math convention):
         -   post-down-proj:             h = W @ x + bias
-        -   post-up-proj constraint:    A @ h > b
-        -   post-up-proj eq constraint: A_eq @ h == b_eq
+        -   post-down-proj constraint:    A @ h > b
+        -   post-down-proj eq constraint: A_eq @ h == b_eq
 
         =>  A @ W @ x + A @ bias > b
         =>  A @ W @ x > b - A @ bias
@@ -660,8 +793,10 @@ class ConstraintSet:
         """
         assert isinstance(self.A, np.ndarray), 'No constraints to reverse'
 
-        new_A = self.A @ W
-        new_b = self.b - self.A @ bias
+        W_full, bias_full = self._carry_suffix(W, bias)
+
+        new_A = self.A @ W_full
+        new_b = self.b - self.A @ bias_full
 
         assert not isinstance(self.A_eq, np.ndarray), \
             'Not expecting existing equality constraints, but got ' + \
@@ -680,6 +815,7 @@ class ConstraintSet:
             inequalities=self.inequalities,
             A_eq=A_eq,
             b_eq=b_eq,
+            block_sizes=[W.shape[1]] + self.block_sizes[1:],
         )
 
     def save_to_pkl(self, file_path: str | Path):

@@ -12,6 +12,7 @@ authors = [{ name = "Ryan Tan", email = "ryan.rtjj@gmail.com" }]
 dependencies = [
     "cvxpy",
     "joblib",
+    "matplotlib",
     "numpy",
     "scipy",
 ]
