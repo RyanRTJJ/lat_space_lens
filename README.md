@@ -67,31 +67,27 @@ for region in regions:
 
 This section explains `reverse_add_up_proj` and `reverse_up_proj` (complicated). Suppose we have:
 
-$$
-\begin{align*}
+```math
+\begin{aligned}
 p &= Wx + My + \mathrm{bias},\\
 z &= \mathrm{ReLU}(p)
-\end{align*}
-$$
+\end{aligned}
+```
 
 Further suppose that $x$ is the product of earlier network layers, but $y$ is a fresh input (such as in the case of an RNN), we want to reverse a constraint on $z$ in the form $Az > b$ to constraints on $y$ and $x$ (or further upstream inputs that made up $x$).
 
 ### `reverse_add_up_proj`
 
 We have to think of:
-$$
-\begin{align*}
-Az &> b
-\end{align*}
-$$
+```math
+Az > b
+```
 
 as:
 
-$$
-\begin{align*}
-A \cdot \text{ReLU}\left( \begin{bmatrix} W \mid M \end{bmatrix} \begin{bmatrix} x \\ y \end{bmatrix} + \mathrm{bias} \right) &> b
-\end{align*}
-$$
+```math
+A \cdot \text{ReLU}\left( \begin{bmatrix} W \mid M \end{bmatrix} \begin{bmatrix} x \\ y \end{bmatrix} + \mathrm{bias} \right) > b
+```
 
 
 **Block structure.** 
@@ -121,19 +117,23 @@ The leading (left-most) block is always assumed to continue reversing into previ
 Once a layer has injected a fresh input, the variable being constrained is no
 longer one homogeneous vector. It is a concatenation
 
-$$v = \begin{bmatrix} x \\ y \end{bmatrix}$$
+```math
+v = \begin{bmatrix} x \\ y \end{bmatrix}
+```
 
 where $x$ is the **active** block, the only part still being reversed, and $y$ is the **suffix**: injected inputs that are already done and just riding along.
 
 As mentioned, only $x$ is the output of previous layers, so $x$ is the result of some previous up-projection:
 
-$$
+```math
 x = Wu + \mathrm{bias}
-$$
+```
 
 The layer we are reversing maps into the active block only, with $u$ the new active variable, while $y$ passes through untouched. So the map on the *whole* variable is $W$ in one corner and an identity in the other:
 
-$$\begin{bmatrix} x \\ y \end{bmatrix} = \begin{bmatrix} W & 0 \\ 0 & I \end{bmatrix} \begin{bmatrix} u \\ y \end{bmatrix} + \begin{bmatrix} \mathrm{bias} \\ 0 \end{bmatrix}$$
+```math
+\begin{bmatrix} x \\ y \end{bmatrix} = \begin{bmatrix} W & 0 \\ 0 & I \end{bmatrix} \begin{bmatrix} u \\ y \end{bmatrix} + \begin{bmatrix} \mathrm{bias} \\ 0 \end{bmatrix}
+```
 
 That block-diagonal matrix $W_{\mathrm{full}}$ is exactly what `_carry_suffix` builds:
 
@@ -142,21 +142,17 @@ W_full    = block_diag(W, np.eye(d_suffix))
 bias_full = np.concatenate([bias, np.zeros(d_suffix)])
 ```
 
-Our goal is to now back out constraints on $\begin{bmatrix} u \\ y \end{bmatrix}$. So from:
+Our goal is to now back out constraints on $[u; y]$. So from:
 
-$$
-\begin{align*}
-A \left( W_{\mathrm{full}} \begin{bmatrix} u \\ y \end{bmatrix} + \mathrm{bias}_\mathrm{full} \right) &> b
-\end{align*}
-$$
+```math
+A \left( W_{\mathrm{full}} \begin{bmatrix} u \\ y \end{bmatrix} + \mathrm{bias}_\mathrm{full} \right) > b
+```
 
 We get:
 
-$$
-\begin{align*}
-A \, W_{\mathrm{full}}  \begin{bmatrix} u \\ y \end{bmatrix} &> b - A\,\mathrm{bias}_{\mathrm{full}}
-\end{align*}
-$$
+```math
+A \, W_{\mathrm{full}} \begin{bmatrix} u \\ y \end{bmatrix} > b - A\,\mathrm{bias}_{\mathrm{full}}
+```
 
 
 ```python
