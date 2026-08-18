@@ -59,7 +59,7 @@ class ConstraintSet:
     BLOCK STRUCTURE (self.block_sizes)
     ----------------------------------
     Once a layer INJECTS a variable that did not come from earlier layers
-    (see reverse_add_relu), the variable this constraint set is written over
+    (see reverse_add_up_proj), the variable this constraint set is written over
     stops being a single homogeneous vector and becomes a concatenation:
 
         [ active | y_earliest | ... | y_latest ]
@@ -665,46 +665,12 @@ class ConstraintSet:
         print(f'Regions produced this set: {len(zeroed_dim_idxs_to_constraint_sets)} / {2 ** d_large}\n')
         return zeroed_dim_idxs_to_constraint_sets
 
-    def reverse_add_relu(
+    def reverse_up_proj(
             self,
             W: np.ndarray,
-            M: np.ndarray,
             bias: np.ndarray,
-    ) -> dict[tuple, 'ConstraintSet']:
-        """
-        Same as reverse_relu, but for a relu whose pre-activation is fed by TWO
-        branches instead of one:
-
-            p = W @ x + M @ y + bias        (pre-activation)
-            z = ReLU(p)                     (post-activation)
-
-        `y` is treated as FREE, and the answer is over the joint variable
-        [x; y]. This is a relaxation if y is itself a function of x upstream.
-
-        The orthant enumeration is completely untouched by the extra branch:
-        it happens in p-space (width d_large), which does not know about x or
-        y at all. The ONLY thing that changes is the equality constraint. The
-        achievable p live on the affine set bias + span([W M]), so with
-        N = null_space([W M].T):
-
-            N.T @ p = N.T @ (W @ x + M @ y + bias) = N.T @ bias
-
-        i.e. A_eq = N.T and b_eq = A_eq @ bias, same expression as the
-        single-branch case with [W M] substituted for W. So we can defer to
-        reverse_relu on the stacked matrix outright.
-
-        @param W:       shape (d_large, d_x)
-        @param M:       shape (d_large, d_y)
-
-        @return:        dict of zeroed_dim_idxs to ConstraintSet, in p-space
-                        (width d_large). Feed these to reverse_add_up_proj to
-                        land in joint [x; y] space.
-        """
-        assert W.shape[0] == M.shape[0], \
-            f'W and M must agree on d_large, got {W.shape[0]} and {M.shape[0]}'
-        return self.reverse_relu(np.hstack([W, M]), bias)
-
-    def reverse_up_proj(self, W: np.ndarray, bias: np.ndarray):
+            layer_is_followed_by_relu: bool = True,
+    ):
         """
         This is supposed to be easy (entirely linear). You have (math convention):
         -   post-up-proj:               h = W @ x + bias
@@ -717,9 +683,16 @@ class ConstraintSet:
         =>  A_eq @ W @ x + A_eq @ bias == b_eq
         =>  A_eq @ W @ x == b_eq - A_eq @ bias
 
-        The only gotcha is that when you go from high d back down to low d,
-        you can drop the equality constraints, because the equality constraints
-        are due to the assumption that the points are on this hyperplane.
+        @param layer_is_followed_by_relu:
+            True (default) means A_eq is the image constraint reverse_relu built
+            from this same W: A_eq == null_space(W.T).T, b_eq == A_eq @ bias.
+            Then A_eq @ W == 0 and b_eq - A_eq @ bias == 0, so the substitution
+            leaves 0 == 0 and we drop it. Dropped rather than computed because
+            A_eq @ W comes out as ~1e-16 noise, not exact zeros.
+
+            False means A_eq is some other equality, substituted through like
+            the inequality block. If the result is contradictory the region is
+            empty and is_feasible() says so.
         """
         assert isinstance(self.A, np.ndarray), 'No constraints to reverse'
 
@@ -728,8 +701,12 @@ class ConstraintSet:
         new_A = self.A @ W_full
         new_B = self.b - self.A @ bias_full
 
-        new_A_eq = None
-        new_b_eq = None
+        if layer_is_followed_by_relu or not isinstance(self.A_eq, np.ndarray):
+            new_A_eq = None
+            new_b_eq = None
+        else:
+            new_A_eq = self.A_eq @ W_full
+            new_b_eq = self.b_eq - self.A_eq @ bias_full
 
         return ConstraintSet(
             A=new_A,
@@ -740,7 +717,13 @@ class ConstraintSet:
             block_sizes=[W.shape[1]] + self.block_sizes[1:],
         )
 
-    def reverse_add_up_proj(self, W: np.ndarray, M: np.ndarray, bias: np.ndarray):
+    def reverse_add_up_proj(
+            self,
+            W: np.ndarray,
+            M: np.ndarray,
+            bias: np.ndarray,
+            layer_is_followed_by_relu: bool = True,
+    ):
         """
         The substitution step for the two-branch case: takes constraints on the
         pre-activation p and rewrites them over the joint variable [x; y].
@@ -763,21 +746,32 @@ class ConstraintSet:
 
         @param W:       shape (d_large, d_x)
         @param M:       shape (d_large, d_y)
+        @param layer_is_followed_by_relu:
+                        Forwarded to reverse_up_proj; see there.
         """
         assert W.shape[0] == M.shape[0], \
             f'W and M must agree on d_large, got {W.shape[0]} and {M.shape[0]}'
 
         carried_blocks = self.block_sizes[1:]
-        region = self.reverse_up_proj(np.hstack([W, M]), bias)
+        region = self.reverse_up_proj(
+            np.hstack([W, M]),
+            bias,
+            layer_is_followed_by_relu=layer_is_followed_by_relu,
+        )
         region.block_sizes = [W.shape[1], M.shape[1]] + carried_blocks
         return region
 
-    def reverse_down_proj(self, W: np.ndarray, bias: np.ndarray) -> "ConstraintSet":
+    def reverse_down_proj(
+            self,
+            W: np.ndarray,
+            bias: np.ndarray,
+            layer_is_followed_by_relu: bool = True,
+    ) -> "ConstraintSet":
         """
         This is supposed to be easy (entirely linear). You have (math convention):
-        -   post-down-proj:             h = W @ x + bias
-        -   post-down-proj constraint:    A @ h > b
-        -   post-down-proj eq constraint: A_eq @ h == b_eq
+        -   post-down-proj:                 h = W @ x + bias
+        -   post-down-proj constraint:      A @ h > b
+        -   post-down-proj eq constraint:   A_eq @ h == b_eq
 
         =>  A @ W @ x + A @ bias > b
         =>  A @ W @ x > b - A @ bias
@@ -785,11 +779,14 @@ class ConstraintSet:
         =>  A_eq @ W @ x + A_eq @ bias == b_eq
         =>  A_eq @ W @ x == b_eq - A_eq @ bias
 
-        The only gotcha is that when you go from low d back up to high d,
-        you need to add back the equality constraints that describe the
-        hyperplane (span(W.T)).
+        Same arithmetic as reverse_up_proj; W is just wide here. Nothing is
+        inverted -- this is the preimage, unbounded along null(W).
 
-        NOTE: unless???
+        No hyperplane is added going back up: a full-row-rank down-proj is
+        surjective, so every x is reachable. Pinning x to span(W.T) would keep
+        only the pseudo-inverse's solution and throw away the rest.
+
+        @param layer_is_followed_by_relu:   See reverse_up_proj.
         """
         assert isinstance(self.A, np.ndarray), 'No constraints to reverse'
 
@@ -798,16 +795,12 @@ class ConstraintSet:
         new_A = self.A @ W_full
         new_b = self.b - self.A @ bias_full
 
-        assert not isinstance(self.A_eq, np.ndarray), \
-            'Not expecting existing equality constraints, but got ' + \
-            f'A_eq: \n{self.A_eq}\nb_eq: \n{self.b_eq}'
-
-        # Constraint 3: Have to lie on plane
-        # Q = null_space(W)       # Since W is (d_small, d_large), this gives (d_large, k)
-        # A_eq = Q.T
-        # b_eq = np.zeros(shape=(A_eq.shape[0], )) # Q.T @ bias
-        A_eq = None
-        b_eq = None
+        if layer_is_followed_by_relu or not isinstance(self.A_eq, np.ndarray):
+            A_eq = None
+            b_eq = None
+        else:
+            A_eq = self.A_eq @ W_full
+            b_eq = self.b_eq - self.A_eq @ bias_full
 
         return ConstraintSet(
             A=new_A,
