@@ -182,7 +182,7 @@ def _plot_region_3d(
 def plot_region(
         ax,
         region: ConstraintSet,
-        plot_z: int,
+        plot_z: float,
         color,
         alpha: float):
     """

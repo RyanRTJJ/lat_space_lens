@@ -6,6 +6,7 @@ Author:     ryan.rtjj@gmail.com
 from itertools import combinations
 from pathlib import Path
 import time
+from typing import Literal, overload
 
 import cvxpy as cp
 import joblib
@@ -567,11 +568,28 @@ class ConstraintSet:
             # print('infeasible\n')
             return None
 
+    @overload
     def reverse_relu(
             self,
             W: np.ndarray,
             bias: np.ndarray,
-    ) -> dict[tuple, 'ConstraintSet']:
+            return_metadata: Literal[False] = False,
+    ) -> dict[tuple, 'ConstraintSet']: ...
+
+    @overload
+    def reverse_relu(
+            self,
+            W: np.ndarray,
+            bias: np.ndarray,
+            return_metadata: Literal[True],
+    ) -> tuple[dict[tuple, 'ConstraintSet'], dict]: ...
+
+    def reverse_relu(
+            self,
+            W: np.ndarray,
+            bias: np.ndarray,
+            return_metadata: bool = False,
+    ) -> dict[tuple, 'ConstraintSet'] | tuple[dict[tuple, 'ConstraintSet'], dict]:
         """
         NOTE:           This function is to be run when you can run reverse_relu on a single
                         machine only. Usually this means that relu_dim is <= 16. For parallel
@@ -661,8 +679,13 @@ class ConstraintSet:
 
         _PROFILE_end = time.time()
         _PROFILE_total_time = _PROFILE_end - _PROFILE_start
-        print(f'Time taken: {_PROFILE_total_time}')
-        print(f'Regions produced this set: {len(zeroed_dim_idxs_to_constraint_sets)} / {2 ** d_large}\n')
+        _metadata = {}
+        _metadata['total_time_taken'] = _PROFILE_total_time
+        _metadata['num_regions'] = len(zeroed_dim_idxs_to_constraint_sets)
+        _metadata['num_total_regimes'] = 2 ** d_large
+
+        if return_metadata:
+            return zeroed_dim_idxs_to_constraint_sets, _metadata
         return zeroed_dim_idxs_to_constraint_sets
 
     def reverse_up_proj(
