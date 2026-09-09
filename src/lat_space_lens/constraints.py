@@ -640,7 +640,7 @@ class ConstraintSet:
         else:
             # Find a particular solution to test for negativity. Do this BEFORE
             # padding, while A_eq is still square with the relu's own dims.
-            x_particular = np.linalg.lstsq(A_eq, b_eq, rcond=None)[0]
+            # x_particular = np.linalg.lstsq(A_eq, b_eq, rcond=None)[0]
 
             # The equation of the plane constrains the active block only, so
             # widen it with zeros over the injected suffix. b_eq is unchanged.
@@ -650,8 +650,9 @@ class ConstraintSet:
         for z in range(d_large):
             if not isinstance(A_eq, np.ndarray):
                 z_to_leq_zero_constraint[z] = ConstraintSet.UNCONSTRAINED
-            elif np.all(np.abs(null_basis[z, :]) < TOL):
-                if x_particular[z] > TOL:
+            elif np.all(np.abs(W[z, :]) < TOL):
+                # if x_particular[z] > TOL:
+                if bias[z] > 0:
                     # This hyperplane is at dim[z] > 0
                     z_to_leq_zero_constraint[z] = ConstraintSet.UNSATISFIABLE
                 else:
