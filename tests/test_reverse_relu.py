@@ -1,90 +1,39 @@
 """Test cases for the reverse-ReLU activation pattern search.
 
-The weights below are hard-coded so that this file does not depend on the
-alg_zoo library. They were extracted with:
+The weights and the linear probe live in constants.py, which stores them
+untruncated so that this file depends on neither the alg_zoo library nor network
+access. Each test truncates them itself.
 
-    from alg_zoo import example_2nd_argmax
-    model = example_2nd_argmax()
-    W_hh = as_numpy(model.rnn.weight_hh_l0)
-    W_hi = as_numpy(model.rnn.weight_ih_l0)
-
-and, following lines 500-517 of algozoo/figures_16_10.py with seed=42, from the
-'relu_1_post' linear probe fitted against the labeling inputs[1] > inputs[0] and
-inputs[1] > 0.
-
-All three arrays are stored untruncated. Each test truncates them itself.
+M_16_10_* is the hidden_size=16, seq_len=10 model of the blog post, from
+example_2nd_argmax(), and M_16_10_PROBE its relu_1_post probe.
 """
+import json
+import random
+import re
 from functools import lru_cache
+from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pytest
 
+import constants
+from constants import M_16_10_PROBE
+from constants import M_16_10_W_hh
+from constants import M_16_10_W_hi
 from lat_space_lens import ConstraintSet
-
-# Shape (16, 16), from model.rnn.weight_hh_l0.
-M_16_10_W_hh = np.array([
-    [0.16085967421531677, 0.7108793258666992, -0.17373062670230865, 0.021222922950983047, 0.5948790907859802, -0.9134215712547302, 1.1327556371688843, -0.7758187651634216, -0.7929948568344116, -1.4237356185913086, 0.3074500858783722, 0.15022523701190948, 0.224845290184021, 0.07666322588920593, 0.4203847348690033, 0.00833763275295496],
-    [-0.10828900337219238, 0.4093594551086426, 0.5037025213241577, 0.011614464223384857, 0.8713551759719849, 0.11774849891662598, 0.9953998327255249, -1.0476715564727783, -0.1203792467713356, -0.6862773299217224, 0.023890815675258636, 0.00844612531363964, 0.04300367832183838, 0.029531795531511307, 0.07914742827415466, 0.02005760744214058],
-    [-0.083544060587883, -0.10195071250200272, 0.9688376188278198, 0.03908676654100418, 1.7307186126708984, -0.010148447938263416, -0.10253623872995377, 0.022688522934913635, 0.15453435480594635, -0.22885268926620483, 0.015223793685436249, 0.01761922799050808, 0.055331744253635406, 0.0404987595975399, 0.02686350978910923, -0.04666026681661606],
-    [-1.2293846607208252, 1.1952526569366455, 0.0016773446695879102, -0.35855749249458313, 0.34419357776641846, -0.5175389647483826, 0.48519280552864075, -0.3992026150226593, -1.0741428136825562, 0.2081184983253479, 0.21385245025157928, -0.19370673596858978, 0.4988366663455963, -0.2585681080818176, 0.5884541273117065, 0.8104538917541504],
-    [0.035378072410821915, 0.035622864961624146, -0.492309033870697, -0.0033940111752599478, -0.9856111407279968, 0.0016950786812230945, 0.09330034255981445, -0.029368871822953224, -0.08155543357133865, 0.08339191973209381, -0.006543969735503197, -0.012211793102324009, -0.059153247624635696, -0.026931047439575195, -0.032630957663059235, -0.010949648916721344],
-    [0.2244897484779358, -0.0005086797173134983, -0.03115234524011612, -0.20049084722995758, 1.18705153465271, -0.42111334204673767, 0.015222044661641121, -0.5933382511138916, -0.8497561812400818, 0.2973608076572418, 0.12241365760564804, 0.32778841257095337, 0.2613863945007324, -0.009049180895090103, 0.20479953289031982, 0.07378725707530975],
-    [-0.09288160502910614, -0.13510721921920776, 0.5349642634391785, 0.027262309566140175, -0.04709412902593613, 0.03827216103672981, 0.3605724275112152, -0.12607648968696594, -0.08202435821294785, -0.6400814652442932, 0.028036346659064293, 0.018916036933660507, 0.03955690935254097, 0.01606828346848488, 0.08612384647130966, -0.007887518964707851],
-    [-0.021420316770672798, -0.10036176443099976, 0.673674464225769, -0.008009334094822407, 1.3166165351867676, 0.002307594520971179, -0.18246307969093323, 0.07815435528755188, 0.1666875183582306, 0.002781821181997657, -0.0038847674150019884, 0.029899975284934044, 0.0695122629404068, 0.02172163501381874, -1.44146633829223e-05, -0.012527556158602238],
-    [-0.004610032774507999, 0.6339022517204285, 0.6253562569618225, 0.00046008595381863415, -0.04149255156517029, -0.01696033589541912, -0.00028777666739188135, -1.0941182374954224, 0.6153913140296936, -0.06835651397705078, 0.038094412535429, 0.05488774552941322, 0.04157969355583191, 0.0006598306936211884, 0.03189060091972351, -0.013365192338824272],
-    [-0.03175472095608711, -0.3573145270347595, 0.004240703769028187, -0.04386823996901512, 0.14580999314785004, 0.042859479784965515, -0.08918856084346771, -5.03169584274292, -1.091538429260254, -0.5528503060340881, 0.03271952643990517, 0.0526634156703949, 0.016440190374851227, -0.02579418383538723, 0.10715527087450027, -0.009744048118591309],
-    [0.02329482138156891, 0.21933576464653015, 0.040267977863550186, -0.07655417919158936, 1.7551501989364624, -0.014410154893994331, -0.19324982166290283, 0.20953533053398132, -0.20933137834072113, 0.1367415338754654, -0.0009180240449495614, 1.0963913202285767, -0.052944060415029526, 0.0769883394241333, -0.14415277540683746, -0.018233289942145348],
-    [0.09159789234399796, 0.24272111058235168, 0.12052807211875916, -0.07679963856935501, 1.7147935628890991, -0.07336258143186569, -0.47304779291152954, 0.38181406259536743, -0.16268976032733917, 0.6770923733711243, 0.004319208208471537, 0.19864685833454132, 0.6627523899078369, -0.37509799003601074, -0.09607867896556854, -0.11855030804872513],
-    [0.04805900901556015, 0.4691668450832367, -0.15610577166080475, -0.31037014722824097, 1.277097225189209, -0.13563401997089386, -0.10376353561878204, -0.052235428243875504, -0.2794184386730194, 0.8097546100616455, -0.1195620745420456, 0.006817629095166922, 0.6116837859153748, 0.41391894221305847, 0.3413048982620239, 0.45148342847824097],
-    [0.15144023299217224, 0.22470158338546753, 0.3836003243923187, 0.42706066370010376, 0.4640190005302429, -0.08552108705043793, 0.12046020478010178, 0.0021140126045793295, -0.28891855478286743, 0.03941412270069122, 0.2768874168395996, -0.0884568989276886, -0.261484831571579, -0.6050072908401489, -0.2199770212173462, 0.6537340879440308],
-    [0.40283897519111633, 0.17081186175346375, 0.33529049158096313, -0.35768941044807434, 0.870553195476532, -0.42392316460609436, 0.7650881409645081, -0.7119308114051819, -0.0649804174900055, -0.6493614315986633, 0.2504397928714752, 0.01723763346672058, -0.01888456381857395, -0.1592029482126236, 0.3550436794757843, -0.19347253441810608],
-    [0.26571419835090637, 0.6518830060958862, 0.38408952951431274, 0.3787323534488678, 0.1794251799583435, -0.6631624698638916, 0.3805694580078125, -0.16141794621944427, -0.723532497882843, -0.19514645636081696, -1.0929720401763916, 1.2795950174331665, -0.2241012454032898, -0.5291746854782104, 0.1376325488090515, 0.22866342961788177],
-])
-
-# Shape (16, 1), from model.rnn.weight_ih_l0.
-M_16_10_W_hi = np.array([
-    [0.06919536739587784],
-    [-10.564790725708008],
-    [0.014607131481170654],
-    [-0.12265294790267944],
-    [10.156975746154785],
-    [-0.28130465745925903],
-    [-10.995721817016602],
-    [-13.16869068145752],
-    [-12.312334060668945],
-    [-0.22756263613700867],
-    [0.05984975025057793],
-    [0.14799705147743225],
-    [0.29800716042518616],
-    [-0.04701320827007294],
-    [-1.3206626176834106],
-    [-0.1191084161400795],
-])
-
-# Shape (16,), the weight vector of the linear probe.
-M_16_10_PROBE = np.array([
-    0.09444186163805308,
-    -0.7455110259093655,
-    0.01304305582993644,
-    0.8545640623647488,
-    3.678650892008945,
-    -0.045853798041207865,
-    -0.7562236969871922,
-    -1.0624333470795098,
-    -0.6929935339358955,
-    -3.131283866278705,
-    0.0716980552584158,
-    0.129229610859309,
-    0.2600607835880996,
-    -0.030293138139114016,
-    -0.6733422825122595,
-    -0.8279930076631422,
-])
 
 # figures_16_10.py substitutes this for the probe threshold, because the probe is
 # fitted with a hard-coded intercept of 0.0 and the region would otherwise be
 # degenerate.
 TIIINY = 0.0001
+
+# The palette of algozoo/figures_16_10.py, so that a figure produced here sits
+# alongside the ones produced there without a change of colour scheme.
+PAPER = '#fcfbf8'
+CLOUD_LIGHT = '#bfbfba'
+CLOUD_MEDIUM = '#91918d'
+BOOK_CLOTH = '#cc785c'
 
 
 @pytest.mark.parametrize(
@@ -97,7 +46,7 @@ TIIINY = 0.0001
         (6, 60, 77),
     ],
 )
-def test_seqlen_2_rnn(trunc_dim, expected_layer_1_regions, expected_layer_0_regions):
+def test_seqlen_2_rnn(trunc_dim: Literal[2] | Literal[3] | Literal[4] | Literal[5] | Literal[6], expected_layer_1_regions: Literal[2] | Literal[6] | Literal[14] | Literal[30] | Literal[60], expected_layer_0_regions: Literal[6] | Literal[11] | Literal[20] | Literal[42] | Literal[77]):
     """Mimics back_prop_lat_space_relu_1_post in algozoo/figures_16_10.py.
 
     The sequence length is 2, so there are two ReLU layers. The loop over
@@ -230,7 +179,7 @@ def _up_closure_violations(feasible, trunc_dim):
 
 
 @pytest.mark.parametrize('trunc_dim', [2, 3, 4])
-def test_post_image_feasibility_is_monotone_at_layer_1(trunc_dim):
+def test_post_image_feasibility_is_monotone_at_layer_1(trunc_dim: Literal[2] | Literal[3] | Literal[4]):
     """W_hh_hi has full row rank. The post image test is monotone here."""
     _, W_hh_hi, no_bias, root, _ = _pipeline(trunc_dim)
 
@@ -243,7 +192,7 @@ def test_post_image_feasibility_is_monotone_at_layer_1(trunc_dim):
 
 
 @pytest.mark.parametrize('trunc_dim', [2, 3, 4])
-def test_post_image_feasibility_is_monotone_at_layer_0(trunc_dim):
+def test_post_image_feasibility_is_monotone_at_layer_0(trunc_dim: Literal[2] | Literal[3] | Literal[4]):
     """W_hi has rank 1, and the post image test is monotone there anyway.
 
     This is the case that the pre-image test gets wrong. The pre-image is pinned to
@@ -260,7 +209,7 @@ def test_post_image_feasibility_is_monotone_at_layer_0(trunc_dim):
 
 
 @pytest.mark.parametrize('trunc_dim', [2, 3, 4, 5, 6])
-def test_reverse_relu_with_pruning_matches_exhaustive_at_layer_1(trunc_dim):
+def test_reverse_relu_with_pruning_matches_exhaustive_at_layer_1(trunc_dim: Literal[2] | Literal[3] | Literal[4] | Literal[5] | Literal[6]):
     """Pruning must not change the answer."""
     _, W_hh_hi, no_bias, root, _ = _pipeline(trunc_dim)
 
@@ -286,7 +235,7 @@ def test_reverse_relu_with_pruning_matches_exhaustive_at_layer_1(trunc_dim):
 
 
 @pytest.mark.parametrize('trunc_dim', [2, 3, 4, 5, 6])
-def test_reverse_relu_with_pruning_matches_exhaustive_at_layer_0(trunc_dim):
+def test_reverse_relu_with_pruning_matches_exhaustive_at_layer_0(trunc_dim: Literal[2] | Literal[3] | Literal[4] | Literal[5] | Literal[6]):
     """The rank-1 layer, where pruning on the pre-image would have lost regions."""
     W_hi, _, no_bias, _, layer_1_regions = _pipeline(trunc_dim)
 
@@ -318,7 +267,7 @@ def _print_timing_row(
           f'{speedup:>7.2f}x {regimes:>8} {calls:>7} {regions:>8}')
 
 
-def timing_report(trunc_dims=(9, 10), skip_exhaustive=False):
+def short_timing_report(trunc_dims=(9, 10), skip_exhaustive=False):
     """Print exhaustive against pruned wall clock, taken from return_metadata.
 
     This asserts nothing and pytest does not collect it, because its numbers depend
@@ -367,5 +316,533 @@ def timing_report(trunc_dims=(9, 10), skip_exhaustive=False):
         )
 
 
+# ---------------------------------------------------------------------------
+# The same timing, over contiguous submatrices sampled from the whole zoo
+# ---------------------------------------------------------------------------
+
+_W_HH_NAME_RE = re.compile(
+    r'^(?P<prefix>(?:M|ZOO)_(?P<dim>\d+)_(?P<seq_len>\d+))_W_hh$'
+)
+
+
+@lru_cache(maxsize=None)
+def _available_models():
+    """(seq_len, dim) -> constant name prefix, for every model in constants.py.
+
+    Read off the constant names rather than listed here, so that regenerating
+    constants.py over a different grid needs no change in this file.
+
+    A model counts only if it carries probes under the _PROBE_RELU_{L}
+    convention. That excludes M_16_10, whose single probe is named M_16_10_PROBE
+    because it is the example checkpoint rather than a zoo one, and which would
+    otherwise collide with ZOO_16_10 on the key (10, 16).
+    """
+    models = {}
+    for name in dir(constants):
+        match = _W_HH_NAME_RE.match(name)
+        if match is None:
+            continue
+        prefix = match.group('prefix')
+        if not hasattr(constants, f'{prefix}_PROBE_RELU_0'):
+            continue
+        key = (int(match.group('seq_len')), int(match.group('dim')))
+        assert key not in models, \
+            f'two models share the key {key}: {models[key]} and {prefix}'
+        models[key] = prefix
+    return models
+
+
+def _submatrix_triplets(seq_len, dim):
+    """The (model_seq_len, model_dim, start_dim_idx) triplets this search can use.
+
+    A model qualifies when it has at least `seq_len` ReLU layers, at least `dim`
+    hidden dims, and the relu_{seq_len - 1}_post probe that the root constraint
+    is built from. Each qualifying model contributes one triplet per contiguous
+    dim-wide window of its dims, so the triplet names a unique submatrix.
+    """
+    triplets = []
+    for (model_seq_len, model_dim), prefix in _available_models().items():
+        if model_seq_len < seq_len or model_dim < dim:
+            continue
+        if not hasattr(constants, f'{prefix}_PROBE_RELU_{seq_len - 1}'):
+            continue
+        for start_dim_idx in range(0, model_dim - dim + 1):
+            triplets.append((model_seq_len, model_dim, start_dim_idx))
+    return sorted(triplets)
+
+
+def _truncated_weights(triplet, seq_len, dim):
+    """One triplet's contiguous submatrices, and the root constraint over them.
+
+    The window is taken out of W_hh, W_hi and the probe alike, so the truncated
+    weights are those of a well-defined smaller recurrence. It is not the model
+    that would be trained at this size, and the probe is the full model's probe
+    restricted to the window rather than one fitted on it: as in the tests above,
+    these numbers are about the size of the linear-programming search, not about
+    what the truncated network computes.
+    """
+    model_seq_len, model_dim, start_dim_idx = triplet
+    prefix = _available_models()[(model_seq_len, model_dim)]
+    stop = start_dim_idx + dim
+
+    W_hi = getattr(constants, f'{prefix}_W_hi')[start_dim_idx:stop]
+    W_hh = getattr(
+        constants, f'{prefix}_W_hh'
+    )[start_dim_idx:stop, :][:, start_dim_idx:stop]
+    probe_direction = getattr(
+        constants, f'{prefix}_PROBE_RELU_{seq_len - 1}'
+    )[start_dim_idx:stop]
+
+    W_hh_hi = np.hstack([W_hh, W_hi])
+    no_bias = np.zeros(W_hh.shape[0])
+
+    A = probe_direction[None, :]
+    root = ConstraintSet(
+        A,
+        np.full(A.shape[0], TIIINY),
+        [ConstraintSet.GE] * A.shape[0]
+    )
+    return W_hi, W_hh, W_hh_hi, no_bias, root
+
+
+def _assert_same_regions(exhaustive, pruned, context):
+    """Enforce that pruning returned exactly what the exhaustive search did.
+
+    Same orthants, and for each one the same region: pruning is only allowed to
+    skip work, never to change the answer. Both paths build their regions in
+    reverse_relu_for_Z_tuple from the same arguments, so every field should agree
+    bitwise, not merely to a tolerance.
+
+    This is what test_reverse_relu_with_pruning_matches_exhaustive_at_layer_1 and
+    _at_layer_0 assert, checked here on the sampled submatrices instead of on the
+    one model those tests use.
+    """
+    assert set(exhaustive) == set(pruned), (
+        f'{context}: exhaustive and pruned disagree on which orthants have a '
+        f'region, only exhaustive has {sorted(set(exhaustive) - set(pruned))}, '
+        f'only pruned has {sorted(set(pruned) - set(exhaustive))}'
+    )
+    for z_tuple in exhaustive:
+        for field in ('A', 'b', 'inequalities', 'block_sizes'):
+            exhaustive_value = getattr(exhaustive[z_tuple], field)
+            pruned_value = getattr(pruned[z_tuple], field)
+            assert np.array_equal(exhaustive_value, pruned_value), (
+                f'{context}: orthant {z_tuple} differs in {field}, '
+                f'exhaustive {exhaustive_value}, pruned {pruned_value}'
+            )
+
+
+def _reverse_one_layer(
+        regions,
+        W,
+        no_bias,
+        substitute,
+        skip_exhaustive,
+        test_equality=False,
+        context='',
+    ):
+    """Reverse one ReLU layer over every region, exhaustive against pruned.
+
+    `substitute` rewrites one pre-activation region over the variable the next
+    layer back starts from: reverse_add_up_proj at every layer that has a
+    previous hidden state to reverse into, reverse_up_proj at layer 0.
+
+    The two methods return the same regions, so the ones that propagate are read
+    off the pruned run, which is the one that always happens. Under
+    `test_equality` that sameness stops being an assumption and is checked on
+    every region, which needs the exhaustive run and so rules out
+    `skip_exhaustive`.
+    """
+    assert not (test_equality and skip_exhaustive), \
+        'test_equality needs the exhaustive regions to compare against'
+
+    exhaustive_seconds = pruned_seconds = 0.
+    regimes = calls = num_regions = 0
+    next_regions = []
+    for region in regions:
+        exhaustive_region_dict = None
+        if not skip_exhaustive:
+            exhaustive_region_dict, exhaustive = region.reverse_relu(
+                W, no_bias, return_metadata=True
+            )
+            exhaustive_seconds += exhaustive['total_time_taken']
+        pre_activation_region_dict, pruned = region.reverse_relu_with_pruning(
+            W, no_bias, return_metadata=True
+        )
+        if test_equality:
+            _assert_same_regions(
+                exhaustive_region_dict, pre_activation_region_dict, context
+            )
+        pruned_seconds += pruned['total_time_taken']
+        regimes += pruned['num_total_regimes']
+        calls += pruned['num_verifier_calls']
+        num_regions += pruned['num_regions']
+        for pre_activation_region in pre_activation_region_dict.values():
+            next_regions.append(substitute(pre_activation_region))
+
+    row = {
+        'regions_in': len(regions),
+        'exhaustive_seconds': exhaustive_seconds,
+        'pruned_seconds': pruned_seconds,
+        'num_total_regimes': regimes,
+        'num_verifier_calls': calls,
+        'num_regions': num_regions,
+    }
+    return next_regions, row
+
+
+def _print_full_timing_row(triplet, layer, row):
+    model_seq_len, model_dim, start_dim_idx = triplet
+    pruned_seconds = row['pruned_seconds']
+    speedup = (
+        row['exhaustive_seconds'] / pruned_seconds
+        if pruned_seconds else float('nan')
+    )
+    print(f"{model_seq_len:>4} {model_dim:>4} {start_dim_idx:>6} {layer:>6} "
+          f"{row['regions_in']:>8} {row['exhaustive_seconds']:>13.4f} "
+          f"{pruned_seconds:>10.4f} {speedup:>7.2f}x "
+          f"{row['num_total_regimes']:>9} {row['num_verifier_calls']:>8} "
+          f"{row['num_regions']:>8}")
+
+
+def full_timing_report(
+        seq_len,
+        dim,
+        n=3,
+        seed=42,
+        skip_exhaustive=False,
+        test_equality: bool = False,
+        save_to=None,
+    ):
+    """short_timing_report over submatrices sampled from every model in the zoo.
+
+    short_timing_report walks one model at a handful of truncation widths. This
+    walks `n` randomly chosen contiguous dim-wide windows drawn from every model
+    with room for the search, so the timings are not all read off the same
+    weights.
+
+    The eligible windows are the (model_seq_len, model_dim, start_dim_idx)
+    triplets of _submatrix_triplets: every model with at least `seq_len` ReLU
+    layers and at least `dim` hidden dims contributes one triplet per start
+    index. `n` of them are sampled without replacement, seeded by `seed`.
+
+    Each sampled window is reversed through all `seq_len` ReLU layers, starting
+    from the relu_{seq_len - 1}_post probe half-space. Layers seq_len - 1 down to
+    1 substitute with reverse_add_up_proj, which injects that layer's input
+    coordinate as a frozen block; layer 0 has no previous hidden state and
+    substitutes with reverse_up_proj. Every layer therefore reverses a ReLU on
+    `dim` dims, so each region costs up to 2 ** dim orthants, and the region
+    count multiplies from one layer to the next. Both grow fast: `dim` in the
+    teens with more than a couple of layers will not finish.
+
+    The times are the 'total_time_taken' the two methods report, which covers the
+    orthant loop only and excludes setup, summed over every region entering the
+    layer. This asserts nothing and pytest does not collect it, because its
+    numbers depend on the machine and on what else is running.
+
+    @param seq_len:         number of ReLU layers to reverse. At most 4, because
+                            the root is the relu_{seq_len - 1}_post probe and
+                            constants.py carries probes for layers 0 to 3
+    @param dim:             width of the contiguous window to take
+    @param n:               how many windows to sample
+    @param seed:            seeds the sample
+    @param skip_exhaustive: only run the pruned search, leaving the exhaustive
+                            column at 0 and the speedup meaningless
+    @param test_equality:   check at every layer that the pruned search returned
+                            exactly the regions the exhaustive one did, the same
+                            orthants with bitwise identical constraints. Raises
+                            on the first disagreement. Needs the exhaustive
+                            regions, so it cannot be combined with
+                            `skip_exhaustive`
+    @param save_to:         where to write the JSON record, which holds the
+                            arguments, the sampled triplets and every row.
+                            Defaults to a name built from the arguments, in the
+                            current working directory. None of it is printed
+                            that is not also saved
+    @return:                the path written to
+    """
+    if seq_len < 1:
+        raise ValueError(f'seq_len must be at least 1, got {seq_len}')
+    if dim < 1:
+        raise ValueError(f'dim must be at least 1, got {dim}')
+    if test_equality and skip_exhaustive:
+        raise ValueError(
+            'test_equality compares the pruned regions against the exhaustive '
+            'ones, so it cannot be used with skip_exhaustive'
+        )
+
+    triplets = _submatrix_triplets(seq_len, dim)
+    if not triplets:
+        raise ValueError(
+            f'no model in constants.py has at least {seq_len} ReLU layers, at '
+            f'least {dim} hidden dims and a relu_{seq_len - 1}_post probe'
+        )
+    if n > len(triplets):
+        raise ValueError(
+            f'asked for {n} submatrices but only {len(triplets)} exist for '
+            f'seq_len={seq_len}, dim={dim}'
+        )
+    sampled = sorted(random.Random(seed).sample(triplets, n))
+
+    if save_to is None:
+        save_to = f'full_timing_report_seq{seq_len}_dim{dim}_n{n}_seed{seed}.json'
+    save_to = Path(save_to)
+
+    print(f'seq_len={seq_len} dim={dim} n={n} seed={seed} '
+          f'skip_exhaustive={skip_exhaustive} test_equality={test_equality}')
+    print(f'sampled {n} of {len(triplets)} eligible submatrices: {sampled}')
+    print(f'{"mseq":>4} {"mdim":>4} {"start":>6} {"layer":>6} {"regions in":>8} '
+          f'{"exhaustive s":>13} {"pruned s":>10} {"speedup":>8} '
+          f'{"regimes":>9} {"calls":>8} {"regions":>8}')
+
+    rows = []
+    for triplet in sampled:
+        W_hi, W_hh, W_hh_hi, no_bias, root = _truncated_weights(
+            triplet, seq_len, dim
+        )
+        regions = [root]
+
+        # Layers seq_len - 1 down to 1. Each one reverses the ReLU over the joint
+        # variable [h_{t-1}; x_t] and then freezes x_t into the injected suffix.
+        for layer in range(seq_len - 1, 0, -1):
+            regions, row = _reverse_one_layer(
+                regions,
+                W_hh_hi,
+                no_bias,
+                lambda pre_activation_region: (
+                    pre_activation_region.reverse_add_up_proj(W_hh, W_hi, no_bias)
+                ),
+                skip_exhaustive,
+                test_equality=test_equality,
+                context=f'{triplet} layer {layer}',
+            )
+            _print_full_timing_row(triplet, layer, row)
+            rows.append({
+                'model_seq_len': triplet[0],
+                'model_dim': triplet[1],
+                'start_dim_idx': triplet[2],
+                'layer': layer,
+                **row,
+            })
+
+        # Layer 0 has no previous hidden state, so there is nothing to inject and
+        # the substitution is a plain reverse_up_proj.
+        regions, row = _reverse_one_layer(
+            regions,
+            W_hi,
+            no_bias,
+            lambda pre_activation_region: (
+                pre_activation_region.reverse_up_proj(W_hi, no_bias)
+            ),
+            skip_exhaustive,
+            test_equality=test_equality,
+            context=f'{triplet} layer 0',
+        )
+        _print_full_timing_row(triplet, 0, row)
+        rows.append({
+            'model_seq_len': triplet[0],
+            'model_dim': triplet[1],
+            'start_dim_idx': triplet[2],
+            'layer': 0,
+            **row,
+        })
+
+    record = {
+        'seq_len': seq_len,
+        'dim': dim,
+        'n': n,
+        'seed': seed,
+        'skip_exhaustive': skip_exhaustive,
+        'test_equality': test_equality,
+        'num_eligible_triplets': len(triplets),
+        'sampled_triplets': [list(triplet) for triplet in sampled],
+        'rows': rows,
+    }
+    save_to.parent.mkdir(parents=True, exist_ok=True)
+    with open(save_to, 'w') as f:
+        json.dump(record, f, indent=2)
+    print(f'\nwrote {save_to}')
+    return save_to
+
+
+def _mean_and_ci_half_width(values, confidence):
+    """Sample mean, and the half width of its two-sided confidence interval.
+
+    The t distribution rather than the normal one, because these reports carry
+    very few samples per layer: at the default n of 3, using 1.96 standard errors
+    would understate the interval by a factor of about 2.2.
+
+    One sample has no spread to estimate from, so its half width is 0. That is a
+    missing error bar, not a claim that the mean is exact.
+    """
+    from scipy.stats import t as t_distribution
+
+    values = np.asarray(values, dtype=float)
+    n = values.size
+    mean = float(values.mean())
+    if n < 2:
+        return mean, 0.
+    standard_error = float(values.std(ddof=1) / np.sqrt(n))
+    half_width = float(
+        t_distribution.ppf(0.5 + confidence / 2, n - 1) * standard_error
+    )
+    return mean, half_width
+
+
+def analyze_full_timing_report(report_path, save_to=None, confidence=0.95):
+    """Plot a full_timing_report's two searches against how far back they have gone.
+
+    The horizontal axis is the number of layer propagations. The ReLU layers are
+    reversed from the probe backwards, so layer seq_len - 1 is the first one
+    reached and sits at 0, and layer 0 is the last and sits at seq_len - 1. For a
+    4 layer report the layers 3, 2, 1, 0 therefore land on the ticks 0, 1, 2, 3.
+
+    Each tick carries one point per series: the mean, over the sampled
+    submatrices, of the seconds that layer took, with error bars at the given
+    confidence level. The two series are the exhaustive search and the pruned one,
+    so the gap between them is what pruning bought at that depth.
+
+    A report that holds no exhaustive timings, because it was written with
+    skip_exhaustive or because its rows do not carry the field, is plotted from
+    the pruned series alone rather than refused. Only a report with nothing to
+    plot at all is an error.
+
+    @param report_path: the JSON written by full_timing_report
+    @param save_to:     where to write the figure. Defaults to the report's own
+                        path with a .png suffix
+    @param confidence:  the level for the error bars, 0.95 by default
+    @return:            the path written to
+    """
+    # Imported here rather than at module scope so that collecting this file
+    # under pytest does not pay for matplotlib.
+    from matplotlib import pyplot as plt
+
+    report_path = Path(report_path)
+    with open(report_path) as f:
+        record = json.load(f)
+
+    if not record['rows']:
+        raise ValueError(f'{report_path} has no rows')
+
+    seq_len = record['seq_len']
+    rows_by_position = {}
+    for row in record['rows']:
+        # Reversal starts at the probe, so the highest layer is the first reached.
+        position = seq_len - 1 - row['layer']
+        rows_by_position.setdefault(position, []).append(row)
+    positions = sorted(rows_by_position)
+
+    # A run with skip_exhaustive never measured the exhaustive search and wrote
+    # 0.0 in its place, so its rows carry the field but not the timing. Drop the
+    # series rather than draw a line pinned to zero and label it a measurement.
+    series = []
+    if not record.get('skip_exhaustive', False):
+        series.append(('exhaustive', 'exhaustive_seconds', BOOK_CLOTH))
+    series.append(('pruned', 'pruned_seconds', CLOUD_MEDIUM))
+
+    plotted = []
+    for label, key, color in series:
+        means = []
+        half_widths = []
+        for position in positions:
+            # A row from another producer need not carry every field, so take
+            # the mean over the rows that do have it.
+            values = [
+                row[key] for row in rows_by_position[position] if key in row
+            ]
+            if not values:
+                # NaN leaves a gap in the line here, rather than a point at zero
+                # that would read as a layer that took no time.
+                means.append(np.nan)
+                half_widths.append(np.nan)
+                continue
+            mean, half_width = _mean_and_ci_half_width(values, confidence)
+            means.append(mean)
+            half_widths.append(half_width)
+        if not all(np.isnan(mean) for mean in means):
+            plotted.append((label, color, means, half_widths))
+
+    if not plotted:
+        raise ValueError(f'{report_path} carries no timings to plot')
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.set_facecolor(PAPER)
+    # Series carry near-identical times at the shallow end, so their error bars
+    # would be drawn on top of each other. Nudge them apart by a fraction of a
+    # tick; the ticks themselves stay on the integers. A lone series is not
+    # nudged, because there is nothing for it to collide with.
+    dodges = np.linspace(-0.04, 0.04, len(plotted)) if len(plotted) > 1 else [0.]
+    for (label, color, means, half_widths), dodge in zip(plotted, dodges):
+        ax.errorbar(
+            [position + dodge for position in positions],
+            means,
+            yerr=half_widths,
+            label=label,
+            color=color,
+            marker='o',
+            markersize=5,
+            capsize=4,
+            linewidth=1.5,
+            elinewidth=1.,
+        )
+
+    percent = round(confidence * 100)
+    ax.set_xlabel('num_layer_propagations')
+    ax.set_ylabel('seconds')
+    ax.set_title(
+        f"seq_len={seq_len} dim={record['dim']} n={record['n']} "
+        f"seed={record['seed']}\nmean orthant loop seconds, {percent}% CI",
+        fontsize=9
+    )
+    ax.set_xticks(positions)
+    # Deliberately not clamped to 0. When the spread is wide enough that the
+    # interval reaches below zero, clipping it there would hide half the error
+    # bar and read as a tighter estimate than the samples support.
+    ax.axhline(0, color=CLOUD_LIGHT, linewidth=0.5)
+    ax.legend()
+    for spine in ('top', 'right'):
+        ax.spines[spine].set_visible(False)
+    fig.tight_layout()
+
+    if save_to is None:
+        save_to = report_path.with_suffix('.png')
+    save_to = Path(save_to)
+    save_to.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_to, dpi=220, facecolor=fig.get_facecolor())
+
+    n_per_position = [len(rows_by_position[position]) for position in positions]
+    print(f'{report_path}: seq_len={seq_len} dim={record["dim"]} '
+          f'n={record["n"]} seed={record["seed"]}')
+    if not any(label == 'exhaustive' for label, *_ in plotted):
+        print('  no exhaustive timings in this report, so the pruned series is '
+              'plotted alone')
+    if min(n_per_position) < 2:
+        print(f'  some positions have one sample, so their {percent}% CI half '
+              f'width is 0 rather than estimated')
+    header = f'{"props":>5} {"layer":>5} {"samples":>7}'
+    for label, *_ in plotted:
+        header += f' {label + " s":>13} {"+-":>9}'
+    print(header)
+    for i, position in enumerate(positions):
+        line = (f'{position:>5} {seq_len - 1 - position:>5} '
+                f'{n_per_position[i]:>7}')
+        for _, _, means, half_widths in plotted:
+            line += f' {means[i]:>13.4f} {half_widths[i]:>9.4f}'
+        print(line)
+    print(f'\nwrote {save_to}')
+
+    plt.show()
+    return save_to
+
+
 if __name__ == '__main__':
-    timing_report()
+    # short_timing_report()
+    full_timing_report(
+        seq_len=4,
+        dim=6,
+        n=5,
+        seed=44,
+        skip_exhaustive=False,
+        test_equality=False,
+    )
+    # analyze_full_timing_report('full_timing_report_seq4_dim4_n5_seed42.json')

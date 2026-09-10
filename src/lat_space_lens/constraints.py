@@ -13,6 +13,7 @@ import joblib
 import numpy as np
 from scipy.linalg import block_diag
 from scipy.linalg import null_space
+from scipy.optimize import linprog
 
 
 # cvxpy's default solver is accurate on these feasibility LPs but occasionally
@@ -46,6 +47,209 @@ def _solve_or_fall_back(problem: cp.Problem) -> None:
             except cp.error.SolverError:
                 continue
         raise default_solver_error
+
+
+# When every solver has failed on a region, is_feasible falls back to deciding it
+# through Farkas' lemma instead. The search for a certificate is posed with the
+# multipliers held in [0, 1], which costs nothing -- certificates form a cone, so
+# any certificate scales down to one whose largest multiplier is 1 -- and buys a
+# linear program that is always feasible, with every multiplier zero, and always
+# bounded. That is the kind a solver settles reliably, unlike the original, whose
+# emptiness was exactly what could not be settled.
+#
+# A certificate found in floating point satisfies A.T @ y + A_eq.T @ z == r for a
+# small r rather than exactly 0, and it then rules out only the x whose r @ x
+# falls short of what it achieves, which is to say the x inside a ball. This is
+# the radius of the ball a certificate must cover before it is believed. The
+# regions this library builds sit far inside it.
+_FARKAS_MIN_RADIUS = 1e6
+
+# Tried in this order. The interior point method settles certificate programs
+# that both simplex methods give up on, and the reverse also happens, so the
+# sweep is not redundant.
+_LINPROG_METHODS = ('highs-ipm', 'highs-ds', 'highs')
+
+# How far a witness may stray outside the constraints and still count. The
+# regions in question are slivers, so a point that lands on one is usually a
+# little outside it.
+_WITNESS_TOL = 1e-9
+
+
+def _verified_witness(
+        A: np.ndarray,
+        b: np.ndarray,
+        A_eq: np.ndarray | None,
+        b_eq: np.ndarray | None,
+    ) -> bool:
+    """
+    Whether a point satisfying the system can be found AND checked.
+
+    The checking is the point. A solver that reports success on one of these
+    regions has often landed somewhere that does not actually satisfy the
+    constraints, so the returned point is substituted back in before its verdict
+    is accepted.
+    """
+    for method in _LINPROG_METHODS:
+        try:
+            result = linprog(
+                c=np.zeros(A.shape[1]),
+                A_ub=-A,
+                b_ub=-b,
+                A_eq=A_eq,
+                b_eq=b_eq,
+                bounds=(None, None),
+                method=method,
+            )
+        except ValueError:
+            continue
+        if result.status != 0 or result.x is None:
+            continue
+        if (A @ result.x - b).min() < -_WITNESS_TOL:
+            continue
+        if isinstance(A_eq, np.ndarray):
+            if np.abs(A_eq @ result.x - b_eq).max() > _WITNESS_TOL:
+                continue
+        return True
+    return False
+
+
+def _exactly_feasible(
+        A: np.ndarray,
+        b: np.ndarray,
+        A_eq: np.ndarray | None = None,
+        b_eq: np.ndarray | None = None,
+    ) -> bool:
+    """
+    Decide {x : A @ x >= b, A_eq @ x == b_eq} in exact arithmetic.
+
+    The last resort, for the regions where every floating point method has failed
+    in both directions: no point could be found and checked, and the search for a
+    certificate could not be settled either.
+
+    There is no rounding here to defeat, which is the whole point. A float is a
+    dyadic rational, so reading the coefficients as fractions loses nothing, and
+    the simplex that follows is over the rationals. The answer is the answer.
+
+    This is affordable only because it is reached so rarely -- of the order of one
+    call in a hundred thousand -- and because the regions it is reached on are
+    small. It is not a general replacement for the numeric path, which is faster
+    by orders of magnitude.
+    """
+    # Imported here rather than at module scope: this path is rare, and sympy is
+    # slow to import.
+    from fractions import Fraction
+
+    import sympy
+    from sympy.solvers.simplex import InfeasibleLPError
+    from sympy.solvers.simplex import UnboundedLPError
+    from sympy.solvers.simplex import lpmin
+
+    def exact(value):
+        return sympy.Rational(Fraction(float(value)))
+
+    variables = sympy.symbols(f'x0:{A.shape[1]}', real=True)
+    constraints = [
+        sum(exact(coefficient) * variable
+            for coefficient, variable in zip(row, variables)) >= exact(rhs)
+        for row, rhs in zip(A, b)
+    ]
+    if isinstance(A_eq, np.ndarray):
+        constraints += [
+            sympy.Eq(
+                sum(exact(coefficient) * variable
+                    for coefficient, variable in zip(row, variables)),
+                exact(rhs),
+            )
+            for row, rhs in zip(A_eq, b_eq)
+        ]
+
+    try:
+        lpmin(sympy.Integer(0), constraints)
+    except InfeasibleLPError:
+        return False
+    except UnboundedLPError:
+        # Unbounded in the objective, which is the constant 0, can only mean the
+        # constraints admit points.
+        return True
+    return True
+
+
+def _decide_by_farkas(
+        A: np.ndarray,
+        b: np.ndarray,
+        A_eq: np.ndarray | None = None,
+        b_eq: np.ndarray | None = None,
+    ) -> bool | None:
+    """
+    Decide whether {x : A @ x >= b, A_eq @ x == b_eq} is non-empty, via Farkas.
+
+    The system is empty exactly when there are y >= 0 and z, unrestricted in
+    sign, with
+
+        A.T @ y + A_eq.T @ z == 0       and       b @ y + b_eq @ z > 0
+
+    since a feasible x would then give
+
+        0 == (A.T @ y + A_eq.T @ z) @ x >= b @ y + b_eq @ z > 0
+
+    using y >= 0 on the inequality rows and equality on the rest. So looking for
+    the best such pair answers the question in both directions: one that achieves
+    something positive proves the system empty, and establishing that none does
+    proves it non-empty.
+
+    @return:    True if non-empty, False if empty, or None if the search itself
+                could not be settled, in which case the caller still knows
+                nothing and should say so rather than guess.
+    """
+    has_eq = isinstance(A_eq, np.ndarray)
+    num_inequalities = A.shape[0]
+    num_equalities = A_eq.shape[0] if has_eq else 0
+
+    # z is unrestricted, so it is searched for as the difference of two
+    # non-negative blocks.
+    blocks = [A.T]
+    achieved_blocks = [b]
+    if has_eq:
+        blocks += [A_eq.T, -A_eq.T]
+        achieved_blocks += [b_eq, -b_eq]
+    columns = np.hstack(blocks)
+    achieved_row = np.hstack(achieved_blocks)
+
+    for method in _LINPROG_METHODS:
+        try:
+            result = linprog(
+                c=-achieved_row,
+                A_eq=columns,
+                b_eq=np.zeros(A.shape[1]),
+                bounds=(0, 1),
+                method=method,
+            )
+        except ValueError:
+            continue
+        if result.status != 0 or result.x is None:
+            continue
+
+        multipliers = np.clip(result.x, 0., None)
+        y = multipliers[:num_inequalities]
+        residual = A.T @ y
+        achieved = b @ y
+        if has_eq:
+            z = (
+                multipliers[num_inequalities:num_inequalities + num_equalities]
+                - multipliers[num_inequalities + num_equalities:]
+            )
+            residual = residual + A_eq.T @ z
+            achieved = achieved + b_eq @ z
+
+        # With a residual r the certificate rules out only the x whose r @ x
+        # falls short of what it achieves, so it covers a ball of that ratio in
+        # radius. Anything less is not a certificate, and since this is the BEST
+        # achievable, there is none: the system is non-empty.
+        if achieved > np.linalg.norm(residual) * _FARKAS_MIN_RADIUS:
+            return False
+        return True
+
+    return None
 
 
 class ConstraintSet:
@@ -332,7 +536,23 @@ class ConstraintSet:
         # Dummy objective: minimize zero
         problem = cp.Problem(cp.Minimize(0), constraints)
 
-        _solve_or_fall_back(problem)
+        try:
+            _solve_or_fall_back(problem)
+        except cp.error.SolverError:
+            # Every solver gave up, which is what they do on a region that has
+            # been squeezed to nothing: there is no interior for an interior
+            # point method to work in, and the weights that would settle the
+            # region either way are too large to survive rounding. Fall back on
+            # a point that can be checked, and failing that on Farkas' lemma,
+            # whose program stays small enough to be settled.
+            if _verified_witness(self.A, self.b, self.A_eq, self.b_eq):
+                return True
+            verdict = _decide_by_farkas(self.A, self.b, self.A_eq, self.b_eq)
+            if verdict is not None:
+                return verdict
+            # Nothing in floating point could settle it either way, so fall back
+            # on arithmetic that has no rounding to be defeated by.
+            return _exactly_feasible(self.A, self.b, self.A_eq, self.b_eq)
 
         # Check feasibility
         if problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:

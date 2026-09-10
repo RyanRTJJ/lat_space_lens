@@ -15,6 +15,7 @@ dependencies = [
     "matplotlib",
     "numpy",
     "scipy",
+    "sympy",
 ]
 
 [tool.hatch.build.targets.wheel]

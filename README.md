@@ -171,3 +171,200 @@ block_sizes = [W.shape[1]] + self.block_sizes[1:]
 constraint set behaves exactly as it did before `block_sizes` existed.
 
 `reverse_down_proj` uses the same helper. Nothing above assumes $W$ is tall.
+
+## Numerical instability in the feasibility solvers
+
+This section is a record of a failure that took a long time to pin down, kept
+looking fixed when it was not, and ended in a four-tier fallback in
+`is_feasible`. It is written out in full because the failure is rare enough that
+the next person to meet it will have no context, and because several of the
+obvious repairs are wrong in ways that are not obvious.
+
+### The symptom
+
+A deep run dies part way through with
+
+```
+cvxpy.error.SolverError: Solver 'CLARABEL' failed.
+```
+
+raised from `ConstraintSet.is_feasible`, by way of `reverse_relu_for_Z_tuple`.
+It appears only in deep searches. The test suite, which goes two layers back,
+has never triggered it. It was first seen at `seq_len=4, dim=6`.
+
+The pruned search is not a way around it. Pruning solves fewer linear programs,
+so it sometimes misses an offending one by luck, but it hits them too.
+
+### What the solver is being asked
+
+`is_feasible` asks whether a region is non-empty:
+
+```math
+\exists x : A x \ge b, \quad A_{\mathrm{eq}} x = b_{\mathrm{eq}}
+```
+
+Each ReLU layer reversed intersects more half-spaces, so regions get thinner
+with depth. Some end up with no interior at all: the constraints admit a single
+point, or nothing.
+
+That is fatal for an interior point method, which works by following a path
+through the strict interior. With no interior there is no path.
+
+Worse, the region carries one constraint with a positive right-hand side: the
+probe half-space, whose threshold is `TIIINY`. `TIIINY` is not a free parameter.
+The probe is fitted with an intercept of exactly zero, so the honest constraint
+is $\text{probe} \cdot x > 0$, strictly. Strict inequalities cannot be handed to
+a solver, so `TIIINY` stands in for the strictness. The smaller it is, the more
+faithfully it represents the question actually being asked.
+
+### Why the solver cannot answer
+
+To report that a system has no solution, a linear programming solver must
+produce a proof, not merely fail to find a point. The proof has one form: pick a
+non-negative weight for each constraint, add the weighted constraints together,
+and show the sum collapses to something absurd of the shape $0 \ge c$ for some
+$c > 0$. Those weights are a Farkas certificate.
+
+In these regions the weights are wildly out of scale with one another. One
+constraint has a very small coefficient on some variable and is the only
+constraint that can supply anything on that variable, so its weight has to be
+enormous to compensate. Weighting a constraint scales *all* of its coefficients,
+so its other, ordinary-sized coefficients blow up with it, and every other
+weight must grow to cancel them.
+
+The proof therefore requires summing enormous quantities that must cancel to
+nothing, leaving a tiny residue which is the actual contradiction. In floating
+point the rounding error on the enormous quantities exceeds the residue. The
+proof dissolves.
+
+The solver can then neither find a point, because there is none, nor prove there
+is none. CLARABEL's raw status is `InsufficientProgress`; cvxpy turns that into
+`SolverError`.
+
+### A minimal example
+
+Six inequalities in three variables, which reproduces the stall exactly:
+
+```
+row 1   -x1 - 0.03 x2               >= 0
+row 2    x1 - 3    x2               >= 0
+row 3   -x1 + 6    x2               >= 0
+row 4   -5 x1 + 29 x2 + 2.5e-4 x3   >= 0
+row 5    0.06 x1 + 4.5 x2 - 6.5 x3  >= 0
+row 6   -1.5 x1 + 19 x2 - 3 x3      >= 1e-4      <- the TIIINY demand
+```
+
+Rows 2 and 3 give $3 x_2 \le x_1 \le 6 x_2$. For $x_2 > 0$ that forces
+$x_1 > 0$, which row 1 forbids. For $x_2 < 0$ it is empty, since
+$6 x_2 < 3 x_2$. So $x_2 = 0$, hence $x_1 = 0$, and rows 4 and 5 then read
+$2.5 \times 10^{-4} x_3 \ge 0$ and $-6.5 x_3 \ge 0$, so $x_3 = 0$.
+
+The first five rows admit only the origin. Row 6 asks for $10^{-4}$ there,
+where the value is 0. Infeasible, by exactly the `TIIINY` margin. Its
+certificate needs weights up to about $1.15 \times 10^9$.
+
+Sweeping either knob shows the band the solver cannot cross:
+
+| row 6 demand | CLARABEL verdict |
+| --- | --- |
+| $\le 10^{-6}$ | `Solved` — wrong, it is infeasible |
+| $10^{-4}$ | `InsufficientProgress` — the stall |
+| $\ge 10^{-2}$ | `PrimalInfeasible` — correct |
+
+Make the contradiction blatant and it is reported. Make it invisible and the
+system is called feasible. Leave it in between and the solver stalls. `TIIINY`
+sits in between.
+
+### Coefficient spread is not the problem
+
+Tempting and wrong. In the real failing region the coefficients span about five
+orders of magnitude, which no solver should struggle with, while the condition
+number is around $10^{32}$. Those are independent: conditioning is about the
+*directions* of the constraints, not the sizes of their entries. Fourteen rows
+spanning only three independent directions is what makes it hard, and that is
+invisible in the largest-over-smallest ratio.
+
+### Approaches that were tried and are wrong
+
+Recorded so they are not retried.
+
+- **Add SCS or OSQP as a fallback.** Both report `optimal` on the failing
+  region. SCS's returned point violates the constraints by $10^{-6}$: it is not
+  feasible. This is the looseness the comment above `_SOLVER_FALLBACKS` already
+  warns about. Trades a crash for silent wrong answers.
+- **Raise `TIIINY`.** The dangerous range is not fixed; it depends on each
+  region's own geometry, so any value sits inside some region's band. Worse,
+  `TIIINY` approximates strict positivity, so raising it changes the question:
+  regions that genuinely satisfy $\text{probe} \cdot x > 0$ get discarded.
+- **Minimise total constraint violation (a phase-1 or elastic program).**
+  Returns "feasible" for a region that is infeasible. The elastic variables let
+  the point step off the region for almost no penalty, so the minimum violation
+  is ~0 whether or not a solution exists.
+- **Add finite box bounds and re-ask.** Also returns "feasible" for the same
+  infeasible region.
+- **Row-scale the certificate program.** Made the residual worse, not better.
+- **Read HiGHS's primal status.** HiGHS reports `model_status is Unknown;
+  primal_status is Infeasible` — it has the answer. But scipy exposes that only
+  inside a free-text message string, with no structural field, and `highspy` is
+  not installed. Parsing it would be fragile.
+
+### The fix
+
+Four tiers in `is_feasible`. Each is tried only when the one before it fails, so
+the ordinary path is unchanged and pays nothing.
+
+1. **cvxpy's default solver**, then `SCIPY` (HiGHS) via `_solve_or_fall_back`.
+   Unchanged, and handles everything but a handful of regions.
+2. **`_verified_witness`.** Look for a point with each of `highs-ipm`,
+   `highs-ds`, `highs`, and substitute it back into the constraints before
+   believing it. The checking is the substance: on these regions a solver
+   frequently reports success at a point that does not satisfy them.
+3. **`_decide_by_farkas`.** Search for a certificate with the multipliers held
+   in $[0, 1]$. Certificates form a cone, so nothing is lost — any certificate
+   scales down to one whose largest multiplier is 1 — and it buys a program that
+   is always feasible (all multipliers zero) and always bounded, which is the
+   kind a solver settles reliably. Because Farkas is an equivalence, this decides
+   **both** directions: a certificate achieving anything positive proves the
+   region empty, and establishing that none does proves it non-empty.
+4. **`_exactly_feasible`.** Exact rational arithmetic, via
+   `sympy.solvers.simplex`. A float is a dyadic rational, so reading the
+   coefficients as fractions loses nothing and the verdict is definitive. There
+   is no rounding left to defeat. This is why `sympy` is a dependency.
+
+`_FARKAS_MIN_RADIUS` guards tier 3. A certificate found in floating point
+satisfies $A^T y + A_{\mathrm{eq}}^T z = r$ for a small $r$ rather than exactly
+zero, and then rules out only the $x$ whose $r \cdot x$ falls short of what it
+achieves — that is, the $x$ inside a ball. The constant is the radius a
+certificate must cover before it is believed. It is an explicit assumption that
+these regions sit well inside that radius, not a proof of emptiness everywhere.
+
+### How often this happens
+
+Measured at `seq_len=4, dim=6`:
+
+- Layer 1, model `(4, 8)` window at index 2: the exhaustive search hit the
+  problem on 2 of 1386 regions, the pruned search on 1 of 1386.
+- Layer 0, model `(5, 16)` window at index 3: 2 linear programs out of roughly
+  586,000 needed tier 4.
+
+Layer 0 is the worst case. `W_hi` has rank 1 there, so the pre-image is pinned
+to a line and the regions are as degenerate as they get.
+
+### A trap when measuring this
+
+`reverse_relu` aborts at its first failing orthant. So wrapping it in
+`try/except SolverError` and counting reveals only **one failure per region**,
+not all of them. This produced a false all-clear during the investigation:
+fixing the observed failures let the search run deeper into the same regions and
+reach later ones that the measurement could never have shown.
+
+To capture the whole set, make the fallback record and then answer rather than
+raise, so a single pass runs to completion.
+
+### If it comes back
+
+Tier 4 cannot fail numerically, so a new failure means something structurally
+different, not another conditioning problem. Check first whether the region is
+genuinely feasible — the assumption that these degenerate regions are empty was
+wrong, and cost a wasted fix. Of the six real cases examined, one was infeasible
+and five were feasible.
