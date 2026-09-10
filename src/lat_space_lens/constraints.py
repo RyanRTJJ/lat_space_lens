@@ -437,6 +437,7 @@ class ConstraintSet:
             A_eq: np.ndarray,
             b_eq: np.ndarray,
             total_width: int | None = None,
+            return_post_image_feasible: bool = False,
     ):
         """
         Helper function to compute the pre-relu image in a particular orthant
@@ -458,13 +459,39 @@ class ConstraintSet:
         @param b_eq:                        The normal form equation of W @ x + bias
         @param total_width:                 Full variable width. Defaults to d_active, i.e. the
                                             un-blocked case.
+        @param return_post_image_feasible:  Also return whether the POST-activation region meets
+                                            this orthant's face, which is a weaker and monotone
+                                            test. See below. The test itself always runs, since
+                                            an empty post image already rules the region out;
+                                            this only decides whether its verdict is returned.
 
-        @return:                            (ConstraintSet | None)
+        @return:                            (ConstraintSet | None), or the pair
+                                            (ConstraintSet | None, post_image_feasible) when
+                                            return_post_image_feasible is set.
+
+        On the two feasibility questions. The region returned here lives in PRE-activation
+        space, so building it asks whether some pre-activation point lands in this orthant
+        AND is reachable as W @ x + bias, the latter being the A_eq constraint. That question
+        is not monotone in F, because moving a dim from Z to F flips its sign constraint
+        rather than relaxing it.
+
+        The post-image question is the weaker one: is there any POST-activation h with h >= 0
+        on F, h == 0 on Z, and the region's own constraints satisfied. Relaxing h_j == 0 to
+        h_j >= 0 only widens that set, so a witness for F is still a witness for every
+        superset of F, whatever W is. It is also implied by pre-image feasibility, since a
+        pre-image witness y yields h by copying y on F and zeroing Z. Those two properties
+        are what reverse_relu_with_pruning needs, and they are why it prunes on this value
+        rather than on whether this function returned None.
         """
         TOL = 1e-10
 
         if total_width is None:
             total_width = d_active
+
+        def _result(region, post_image_feasible):
+            if return_post_image_feasible:
+                return region, post_image_feasible
+            return region
 
         Z = np.array(zeroed_dim_idxs)
         positive_dim_idxs = [i for i in range(d_active) if i not in zeroed_dim_idxs]
@@ -479,7 +506,9 @@ class ConstraintSet:
                 can_unrelu = False
                 break
         if not can_unrelu:
-            return None
+            # Dim z can never be zeroed, so this is infeasible for every subset of F
+            # too, which is the direction pruning needs.
+            return _result(None, False)
 
         # First, we need to get the intersection of self.A and A_Z @ x == 0.
         # This means:
@@ -493,8 +522,10 @@ class ConstraintSet:
         row_norms = np.linalg.norm(A_altered, axis=1)
         infeasible = (row_norms < TOL) & (self.b > TOL) # This is correct
         if np.any(infeasible):
-            # This pretty much never happens except at the very last layer
-            return None
+            # This pretty much never happens except at the very last layer.
+            # A row that is null over F stays null over any subset of F, so this is
+            # infeasible downwards too, and the post image is empty for the same reason.
+            return _result(None, False)
 
         # Delete all null rows
         null_row_idxs = np.argwhere(row_norms < TOL)
@@ -526,6 +557,31 @@ class ConstraintSet:
             A_Z = -np.eye(total_width)[Z,:]
             b_Z = np.zeros(len(Z))
         inequalities_Z = [ConstraintSet.GEQ] * len(Z)
+
+        # The post-image question, asked before the pre-image one because it is both
+        # weaker and monotone. h is a POST-activation point: free above zero on F,
+        # pinned to zero on Z, and subject to the region's own constraints. W does not
+        # appear. An empty post image means an empty region, since a pre-image witness
+        # y would give a post-image witness by copying y on F and zeroing Z, so there
+        # is nothing left to ask below and the answer does not depend on the caller.
+        A_post = np.vstack([A_F, A_altered])
+        b_post = np.hstack([b_F, b_altered])
+        if A_post.shape[0] == 0:
+            # Nothing left to satisfy, and h = 0 meets the sign and zero constraints.
+            post_image_feasible = True
+        else:
+            post_image_feasible = ConstraintSet(
+                A=A_post,
+                b=b_post,
+                # is_feasible reads only A, b, A_eq and b_eq, so the labels here
+                # just have to match the row count.
+                inequalities=[ConstraintSet.GEQ] * A_post.shape[0],
+                A_eq=None if len(Z) == 0 else np.eye(total_width)[Z, :],
+                b_eq=None if len(Z) == 0 else np.zeros(len(Z)),
+                block_sizes=self.block_sizes,
+            ).is_feasible()
+        if not post_image_feasible:
+            return _result(None, False)
 
         A_combined = np.vstack([
             A_F,
@@ -562,11 +618,71 @@ class ConstraintSet:
             # This shit is really slow (takes ~0.01 ~ 0.1 seconds for d_large=15)
             # region.remove_redundant_constraints()
 
-            return region
+            return _result(region, True)
         else:
-            # Empty region, dont add
+            # Empty region, dont add. The post image was still non-empty, so this must
+            # NOT be reported as infeasible to the pruning search: subsets of F may
+            # well have a non-empty pre-image.
             # print('infeasible\n')
-            return None
+            return _result(None, True)
+
+    def _reverse_relu_setup(self, W: np.ndarray, bias: np.ndarray):
+        """
+        The part of reverse_relu that does not depend on which orthant is being
+        tested, shared by reverse_relu and reverse_relu_with_pruning.
+
+        @return:    (d_large, total_width, A_eq, b_eq, z_to_leq_zero_constraint).
+                    A_eq is None exactly when W has full row rank, meaning the
+                    pre-activation point is not pinned to a proper affine subspace.
+        """
+        TOL = 1e-10
+        assert isinstance(self.A, np.ndarray), 'Cant call reverse_up_proj_relu on no constraints'
+
+        # Possible optimization: look for constraints that already look like relu constraints
+        # and dedupe them. Don't think there'll be very many though.
+        d_large, _ = W.shape
+        assert bias.shape[0] == d_large, 'Check your W and bias dims. They need to match.'
+
+        # The relu acts on the active block only; the injected suffix rides along.
+        total_width = self.A.shape[1]
+        assert d_large == self.d_active, \
+            f'relu acts on the active block, so expected W to have {self.d_active} rows, ' \
+            f'got {d_large}'
+
+        # First, figure out which dimensions in which W is being meaningfully unrelued
+        # (i.e. exists region of hyperplane that is negative in that direction)
+        # dimension-wise, we wanna see if the hyperplane varies in that dim
+        # NOTE: This can be cached
+        z_to_leq_zero_constraint = {}
+        null_basis = null_space(W.T)        # (d_large, rank of null space)
+
+        # Precompute the equation of plane in normal form too
+        A_eq = null_basis.T
+        b_eq = A_eq @ bias
+        if len(A_eq) == 0:
+            # Happens when the relu is following a down-projection
+            A_eq = None
+            b_eq = None
+        else:
+            # The equation of the plane constrains the active block only, so
+            # widen it with zeros over the injected suffix. b_eq is unchanged.
+            if total_width > d_large:
+                A_eq = np.hstack([A_eq, np.zeros((A_eq.shape[0], total_width - d_large))])
+
+        for z in range(d_large):
+            if not isinstance(A_eq, np.ndarray):
+                z_to_leq_zero_constraint[z] = ConstraintSet.UNCONSTRAINED
+            elif np.all(np.abs(W[z, :]) < TOL):
+                if bias[z] > 0:
+                    # This hyperplane is at dim[z] > 0
+                    z_to_leq_zero_constraint[z] = ConstraintSet.UNSATISFIABLE
+                else:
+                    # The entire hyperplane is <= 0
+                    z_to_leq_zero_constraint[z] = ConstraintSet.UNCONSTRAINED
+            else:
+                z_to_leq_zero_constraint[z] = ConstraintSet.SOLVABLE
+
+        return d_large, total_width, A_eq, b_eq, z_to_leq_zero_constraint
 
     @overload
     def reverse_relu(
@@ -607,59 +723,15 @@ class ConstraintSet:
                         debugging purposes. You can call flatten_region_dicts() to turn this
                         into a list afterwards.
         """
-        TOL = 1e-10
-        assert isinstance(self.A, np.ndarray), 'Cant call reverse_up_proj_relu on no constraints'
-
-        # Possible optimization: look for constraints that already look like relu constraints
-        # and dedupe them. Don't think there'll be very many though.
-        d_large, _ = W.shape
-        assert bias.shape[0] == d_large, 'Check your W and bias dims. They need to match.'
-
-        # The relu acts on the active block only; the injected suffix rides along.
-        total_width = self.A.shape[1]
-        assert d_large == self.d_active, \
-            f'relu acts on the active block, so expected W to have {self.d_active} rows, ' \
-            f'got {d_large}'
+        (
+            d_large,
+            total_width,
+            A_eq,
+            b_eq,
+            z_to_leq_zero_constraint,
+        ) = self._reverse_relu_setup(W, bias)
 
         dim_combos_for_zeroed_surfaces = self.power_set(d_large)
-
-        # First, figure out which dimensions in which W is being meaningfully unrelued
-        # (i.e. exists region of hyperplane that is negative in that direction)
-        # dimension-wise, we wanna see if the hyperplane varies in that dim
-        # NOTE: This can be cached
-        z_to_leq_zero_constraint = {}
-        null_basis = null_space(W.T)        # (d_large, rank of null space)
-
-        # Precompute the equation of plane in normal form too
-        A_eq = null_basis.T
-        b_eq = A_eq @ bias
-        if len(A_eq) == 0:
-            # Happens when the relu is following a down-projection
-            A_eq = None
-            b_eq = None
-        else:
-            # Find a particular solution to test for negativity. Do this BEFORE
-            # padding, while A_eq is still square with the relu's own dims.
-            # x_particular = np.linalg.lstsq(A_eq, b_eq, rcond=None)[0]
-
-            # The equation of the plane constrains the active block only, so
-            # widen it with zeros over the injected suffix. b_eq is unchanged.
-            if total_width > d_large:
-                A_eq = np.hstack([A_eq, np.zeros((A_eq.shape[0], total_width - d_large))])
-
-        for z in range(d_large):
-            if not isinstance(A_eq, np.ndarray):
-                z_to_leq_zero_constraint[z] = ConstraintSet.UNCONSTRAINED
-            elif np.all(np.abs(W[z, :]) < TOL):
-                # if x_particular[z] > TOL:
-                if bias[z] > 0:
-                    # This hyperplane is at dim[z] > 0
-                    z_to_leq_zero_constraint[z] = ConstraintSet.UNSATISFIABLE
-                else:
-                    # The entire hyperplane is <= 0
-                    z_to_leq_zero_constraint[z] = ConstraintSet.UNCONSTRAINED
-            else:
-                z_to_leq_zero_constraint[z] = ConstraintSet.SOLVABLE
 
         zeroed_dim_idxs_to_constraint_sets = {}
 
@@ -684,6 +756,135 @@ class ConstraintSet:
         _metadata['total_time_taken'] = _PROFILE_total_time
         _metadata['num_regions'] = len(zeroed_dim_idxs_to_constraint_sets)
         _metadata['num_total_regimes'] = 2 ** d_large
+
+        if return_metadata:
+            return zeroed_dim_idxs_to_constraint_sets, _metadata
+        return zeroed_dim_idxs_to_constraint_sets
+
+    @overload
+    def reverse_relu_with_pruning(
+            self,
+            W: np.ndarray,
+            bias: np.ndarray,
+            return_metadata: Literal[False] = False,
+    ) -> dict[tuple, 'ConstraintSet']: ...
+
+    @overload
+    def reverse_relu_with_pruning(
+            self,
+            W: np.ndarray,
+            bias: np.ndarray,
+            return_metadata: Literal[True],
+    ) -> tuple[dict[tuple, 'ConstraintSet'], dict]: ...
+
+    def reverse_relu_with_pruning(
+            self,
+            W: np.ndarray,
+            bias: np.ndarray,
+            return_metadata: bool = False,
+    ) -> dict[tuple, 'ConstraintSet'] | tuple[dict[tuple, 'ConstraintSet'], dict]:
+        """
+        Same contract and same return value as reverse_relu, but it does not test
+        all 2 ** d_large orthants. It prunes whole families of them.
+
+        Each orthant is identified with its set of NON-zeroed dims, written F, whose
+        complement is the set of zeroed dims, written Z. F is encoded as an integer
+        mask in which bit i is 1 exactly when dim i is in F.
+
+        What gets pruned is decided by the post-image test that
+        reverse_relu_for_Z_tuple computes under return_post_image_feasible, namely
+        whether any post-activation point sits in this orthant's face and satisfies
+        the region's constraints. That test obeys
+
+            if an orthant's post image is empty, so is that of every orthant whose F
+            is a subset of its F,
+
+        because moving a dim from Z to F only relaxes h_j == 0 into h_j >= 0. It is
+        also implied by the region being non-empty, so pruning on it can never discard
+        an orthant that reverse_relu would have returned. Neither property depends on
+        W, so this method works whatever the rank of W.
+
+        Note the asymmetry: an orthant whose post image is non-empty but whose
+        pre-image region is empty contributes nothing to the result, yet its children
+        are still expanded, because a subset of its F may well have a non-empty
+        pre-image.
+
+        The search visits the orthants in decreasing size of F, so that an empty post
+        image prunes as large a family as possible. It walks a spanning tree in which
+        the parent of an orthant is obtained by moving its lowest-numbered zeroed dim
+        back into F, so every orthant has exactly one parent and is reached once.
+
+        @param W:       shape (big, small) the up_projection matrix
+
+        @return:        A dict of zeroed_dim_idxs to ConstraintSet, identical to the
+                        one reverse_relu returns for the same arguments.
+        """
+        (
+            d_large,
+            total_width,
+            A_eq,
+            b_eq,
+            z_to_leq_zero_constraint,
+        ) = self._reverse_relu_setup(W, bias)
+
+        zeroed_dim_idxs_to_constraint_sets = {}
+
+        # The maximal orthants with an empty post image found so far, as F masks. An
+        # orthant is already known to have an empty post image when its F is a subset
+        # of one of these, which is what `s & ~M == 0` says.
+        max_infeas = []
+        num_verifier_calls = 0
+        num_post_image_feasible = 0
+
+        _PROFILE_start = time.time()
+
+        frontier = [(1 << d_large) - 1]         # nothing zeroed
+        while frontier:                         # one pass per level, largest F first
+            next_frontier = []
+            for s in frontier:
+                if any(s & ~M == 0 for M in max_infeas):
+                    continue                    # s and everything below it is empty
+
+                zeroed_dim_idxs = [i for i in range(d_large) if not (s >> i) & 1]
+                num_verifier_calls += 1
+                potential_region, post_image_feasible = self.reverse_relu_for_Z_tuple(
+                    d_large,
+                    zeroed_dim_idxs,
+                    z_to_leq_zero_constraint,
+                    A_eq,
+                    b_eq,
+                    total_width=total_width,
+                    return_post_image_feasible=True,
+                )
+
+                if not post_image_feasible:
+                    # Every orthant above s had a non-empty post image, so s is maximal
+                    # among those that do not. Drop any recorded mask inside it.
+                    max_infeas[:] = [x for x in max_infeas if x & ~s] + [s]
+                    continue
+
+                num_post_image_feasible += 1
+                if potential_region is not None:
+                    zeroed_dim_idxs_to_constraint_sets[tuple(zeroed_dim_idxs)] = potential_region
+
+                # Children: zero one more dim, but only within the unbroken run of
+                # non-zeroed dims at the start of s. Any later dim would name a
+                # different parent, and would be reached through that branch instead.
+                i = 0
+                while i < d_large and (s >> i) & 1:
+                    next_frontier.append(s ^ (1 << i))
+                    i += 1
+            frontier = next_frontier
+
+        _PROFILE_end = time.time()
+        _PROFILE_total_time = _PROFILE_end - _PROFILE_start
+        _metadata = {}
+        _metadata['total_time_taken'] = _PROFILE_total_time
+        _metadata['num_regions'] = len(zeroed_dim_idxs_to_constraint_sets)
+        _metadata['num_total_regimes'] = 2 ** d_large
+        _metadata['num_verifier_calls'] = num_verifier_calls
+        _metadata['num_post_image_feasible'] = num_post_image_feasible
+        _metadata['num_maximal_infeasible'] = len(max_infeas)
 
         if return_metadata:
             return zeroed_dim_idxs_to_constraint_sets, _metadata
