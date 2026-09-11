@@ -13,46 +13,43 @@ z = \mathrm{ReLU}(Wx + \mathrm{bias})
 How does the post-ReLU constraint $A \cdot z > b$ (a polyhedron) translate to
 constraints in the pre-image space ($x$)?
 
-Here is the awkward part. $Wx + \mathrm{bias}$ sweeps out a plane, and ReLU
-flattens every negative coordinate of that plane onto zero. So the image is not
-a plane any more: it is a plane folded onto the **positive orthant**. What you
-have to reason about post-ReLU is therefore the orthant and its faces, taken one
-at a time -- the origin, the ray along each axis, the quarter-plane between each
-pair of axes, and the interior. (They are *faces*, not manifolds. Each one is a
-manifold, but "face" is the word for the pieces of a polyhedral cone.)
+The subject of ReLU is the plane $Wx + \mathrm{bias}$, but ReLU flattens every
+negative coordinate onto zero, so what comes out is that plane folded onto the
+**positive orthant**. What you reason about post-ReLU is the orthant and its
+faces, taken one at a time -- the origin (vertex), the ray along each axis
+(edge), the quarter-plane between each pair of axes (face), and the interior
+(volume).
 
 Every face is a sign pattern, and each sign pattern pulls back to one region of
 the plane. In 3D:
 
 * The $(+, +, 0)$ face of the positive hypercube (i.e. the face that spans
-  $e_1, e_2$ at $z_3 = 0$) has a pre-image corresponding to the region of the
-  plane $Wx + \mathrm{bias}$ that has the signs $(+, +, -)$.
-* The $(+, 0, 0)$ face (i.e. the line that spans $e_1$, where $z_2 = 0$ and
-  $z_3 = 0$) has a pre-image corresponding to the region with signs $(+, -, -)$.
+  $e_0, e_1$ at $z_2 = 0$; subscripts are 0-indexed) has a pre-image
+  corresponding to the region of the plane $Wx + \mathrm{bias}$ that has the
+  signs $(+, +, -)$.
+* The $(+, 0, 0)$ face (i.e. the line that spans $e_0$, where $z_1 = 0$ and
+  $z_2 = 0$) has a pre-image corresponding to the region with signs $(+, -, -)$.
 * The $(0, 0, 0)$ face (i.e. the origin) has a pre-image corresponding to the
   region with signs $(-, -, -)$.
 
-...and so on for all $2^3$ of them. Below are the 7 faces that touch the origin
-(the 8th is the interior, left unhighlighted), each next to its own pre-image as
-`reverse_relu` computes it:
+...and so on for all $2^3$ of them. Below: the 7 faces touching the origin (the
+8th, the interior, is left unhighlighted), each next to its pre-image.
 
 <p align="center">
   <img src="figures/orthant_preimage.png"
        alt="Un-ReLU-ing the positive orthant" width="500">
 </p>
 
-Right: the positive orthant. Left: the plane $Wx + \mathrm{bias}$, with the
-pre-image of each face in the matching colour. $W$ here is three unit vectors
-$120^\circ$ apart and $\mathrm{bias}$ is $-0.3$ everywhere, which is tight
-enough that the plane never reaches the interior of the orthant -- the interior
-has no pre-image at all, and the other 7 tile the whole plane between them.
+Right: the positive orthant. Left: the plane, each face's pre-image in the
+matching colour. $W$ is three unit vectors $120^\circ$ apart and
+$\mathrm{bias}$ is $-0.3$ everywhere, so the plane never reaches the interior:
+the interior has no pre-image, and the other 7 tile the plane.
 
 ### Pointing at one direction
 
-Most of the time you don't want the whole orthant. You want one direction in it:
-*what's the pre-image if I want a positive magnitude in the direction of this
-linear probe in post-ReLU space?* That is one more half-space stacked on top of
-$z \geq 0$:
+Usually you want one direction in the orthant, not all of it: *what's the
+pre-image if I want a positive magnitude in the direction of this linear probe?*
+That's one more half-space on top of $z \geq 0$:
 
 ```python
 import numpy as np
@@ -67,23 +64,55 @@ Z_to_region = constraint.reverse_relu(W, bias)
 
 ![The probe's half-space cutting the orthant](figures/probe_constraint.png)
 
-Under the hood, `reverse_relu` intersects your constraint with the constraints
-that define the positive orthant, and then works through the faces of whatever
-polyhedron is left, face by face, exactly as above: for each one it asks which
-part of the plane lands there, and drops the face when the answer is *none of
-it*. The keys of the dict it hands back are the dims that got zeroed, so
-`(0, 2)` is the face where $z_1 = z_3 = 0$.
+`reverse_relu` intersects your constraint with the ones defining the positive
+orthant, then walks the faces of what is left: for each, which part of the plane
+lands there? Faces with no answer are dropped. The returned dict is keyed by the
+zeroed dims, so `(0, 2)` is the face where $z_0 = z_2 = 0$.
 
 <p align="center">
   <img src="figures/probe_preimage.png"
        alt="Un-ReLU-ing the constrained polyhedron" width="500">
 </p>
 
-Same colours as before. The probe throws away the origin, the ray along $e_3$, and
-most of each face that survives, so most of the plane no longer has a pre-image
--- what is left are the slivers.
+Same colours. The probe drops the origin and the ray along $e_2$ outright, and
+most of every face that survives -- what is left of the plane are the slivers.
 
 All three figures come from `generate_figures.py`.
+
+
+## Optimizations
+
+A $d$-dimensional post-ReLU space has $2^d$ orthants, and every region that comes
+back splits into up to $2^d$ more when it is propagated to the layer before, so
+the work scales with $2^{d \times \mathrm{num\_layers}}$.
+
+But a post-ReLU polyhedron does not necessarily contain every face. The linear
+probe above contains neither the origin nor the $(0, 0, +)$ ray, so those
+orthants have no pre-image to compute in the first place. A major optimization is pruning / skipping these orthants.
+
+### Pruning
+
+Let `F` be the dimension indices (0-indexed) that are positive in the post-image.
+The origin vertex is `F = {}`, the $e_2$ ray is `F = {2}`, and the interior
+volume is `F = {0, 1, 2}`.
+
+If the post-ReLU polyhedron does not contain the face for some `F`, then it
+contains no face whose own `F` is a subset of that one. So if `F = {2}` is absent
+-- which it is in the linear probe example above -- then `F = {}` is absent too,
+since `{}` is a subset of `{2}`. Neither needs `reverse_relu` run on it.
+
+The savings are substantial:
+
+<p align="center">
+  <img src="figures/pruning_gains.png"
+       alt="Exhaustive vs pruned orthant loop time" width="500">
+</p>
+
+A small sample -- `seq_len=4`, `dim=6`, 5 models, 95% CI -- of mean seconds in
+the orthant loop against how many layers have been reversed. By the fourth, the
+exhaustive search averages ~2900s to the pruned search's ~1600s, having built
+linear programs for 4.6M orthants against 1.9M. The middle layers gain more
+(2.4x and 2.7x), because that is where the most faces are missing.
 
 ## Install
 
@@ -143,7 +172,7 @@ for region in regions:
     plot_region(ax, region, plot_z=5.0, color='coral', alpha=0.8)
 ```
 
-## Reversing a layer in parallel
+### Reversing a layer in parallel
 
 A layer's regions are independent of each other, so they can be reversed at the
 same time. `reverse_relu_layer` runs one whole `reverse_relu_with_pruning` per
