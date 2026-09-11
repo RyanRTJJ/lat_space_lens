@@ -36,7 +36,10 @@ the plane. In 3D:
 (the 8th is the interior, left unhighlighted), each next to its own pre-image as
 `reverse_relu` computes it:
 
-![Un-ReLU-ing the positive orthant](figures/orthant_preimage.png)
+<p align="center">
+  <img src="figures/orthant_preimage.png"
+       alt="Un-ReLU-ing the positive orthant" width="500">
+</p>
 
 Right: the positive orthant. Left: the plane $Wx + \mathrm{bias}$, with the
 pre-image of each face in the matching colour. $W$ here is three unit vectors
@@ -71,7 +74,10 @@ part of the plane lands there, and drops the face when the answer is *none of
 it*. The keys of the dict it hands back are the dims that got zeroed, so
 `(0, 2)` is the face where $z_1 = z_3 = 0$.
 
-![Un-ReLU-ing the constrained polyhedron](figures/probe_preimage.png)
+<p align="center">
+  <img src="figures/probe_preimage.png"
+       alt="Un-ReLU-ing the constrained polyhedron" width="500">
+</p>
 
 Same colours as before. The probe throws away the origin, the ray along $e_3$, and
 most of each face that survives, so most of the plane no longer has a pre-image
