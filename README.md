@@ -2,6 +2,83 @@
 
 Backpropping feature constraints through ReLU networks to input spaces.
 
+## What this does
+
+Given the following equation:
+
+```math
+z = \mathrm{ReLU}(Wx + \mathrm{bias})
+```
+
+How does the post-ReLU constraint $A \cdot z > b$ (a polyhedron) translate to
+constraints in the pre-image space ($x$)?
+
+Here is the awkward part. $Wx + \mathrm{bias}$ sweeps out a plane, and ReLU
+flattens every negative coordinate of that plane onto zero. So the image is not
+a plane any more: it is a plane folded onto the **positive orthant**. What you
+have to reason about post-ReLU is therefore the orthant and its faces, taken one
+at a time -- the origin, the ray along each axis, the quarter-plane between each
+pair of axes, and the interior. (They are *faces*, not manifolds. Each one is a
+manifold, but "face" is the word for the pieces of a polyhedral cone.)
+
+Every face is a sign pattern, and each sign pattern pulls back to one region of
+the plane. In 3D:
+
+* The $(+, +, 0)$ face of the positive hypercube (i.e. the face that spans
+  $e_1, e_2$ at $z_3 = 0$) has a pre-image corresponding to the region of the
+  plane $Wx + \mathrm{bias}$ that has the signs $(+, +, -)$.
+* The $(+, 0, 0)$ face (i.e. the line that spans $e_1$, where $z_2 = 0$ and
+  $z_3 = 0$) has a pre-image corresponding to the region with signs $(+, -, -)$.
+* The $(0, 0, 0)$ face (i.e. the origin) has a pre-image corresponding to the
+  region with signs $(-, -, -)$.
+
+...and so on for all $2^3$ of them. Below are the 7 faces that touch the origin
+(the 8th is the interior, left unhighlighted), each next to its own pre-image as
+`reverse_relu` computes it:
+
+![Un-ReLU-ing the positive orthant](figures/orthant_preimage.png)
+
+Right: the positive orthant. Left: the plane $Wx + \mathrm{bias}$, with the
+pre-image of each face in the matching colour. $W$ here is three unit vectors
+$120^\circ$ apart and $\mathrm{bias}$ is $-0.3$ everywhere, which is tight
+enough that the plane never reaches the interior of the orthant -- the interior
+has no pre-image at all, and the other 7 tile the whole plane between them.
+
+### Pointing at one direction
+
+Most of the time you don't want the whole orthant. You want one direction in it:
+*what's the pre-image if I want a positive magnitude in the direction of this
+linear probe in post-ReLU space?* That is one more half-space stacked on top of
+$z \geq 0$:
+
+```python
+import numpy as np
+from lat_space_lens import ConstraintSet
+
+probe = np.array([1/4, 1/4, -np.sqrt(3)/4])
+
+# probe . z > 0.3
+constraint = ConstraintSet(probe, 0.3, ConstraintSet.GEQ)
+Z_to_region = constraint.reverse_relu(W, bias)
+```
+
+![The probe's half-space cutting the orthant](figures/probe_constraint.png)
+
+Under the hood, `reverse_relu` intersects your constraint with the constraints
+that define the positive orthant, and then works through the faces of whatever
+polyhedron is left, face by face, exactly as above: for each one it asks which
+part of the plane lands there, and drops the face when the answer is *none of
+it*. The keys of the dict it hands back are the dims that got zeroed, so
+`(0, 2)` is the face where $z_1 = z_3 = 0$.
+
+![Un-ReLU-ing the constrained polyhedron](figures/probe_preimage.png)
+
+Same colours as before. The probe throws away the origin, the ray along $e_3$, and
+most of each face that survives, so most of the plane no longer has a pre-image
+-- what is left are the slivers.
+
+All three figures come from `generate_figures.py`.
+
 ## Install
 
 From GitHub:
@@ -60,8 +137,80 @@ for region in regions:
     plot_region(ax, region, plot_z=5.0, color='coral', alpha=0.8)
 ```
 
-`reverse_relu_helper(region, W, b)` is the top-level (picklable) form of
-`reverse_relu` + flatten, for use with `ProcessPoolExecutor.map`.
+## Reversing a layer in parallel
+
+A layer's regions are independent of each other, so they can be reversed at the
+same time. `reverse_relu_layer` runs one whole `reverse_relu_with_pruning` per
+region and spreads the regions over workers:
+
+```python
+from lat_space_lens import flatten_layer, reverse_relu_layer
+
+# One reverse_relu_with_pruning per region, 8 at a time. Order is preserved.
+region_dicts, metadata = reverse_relu_layer(
+    regions, W, b, executor=8, return_metadata=True
+)
+regions = flatten_layer(region_dicts, lambda r: r.reverse_up_proj(W, b))
+
+print(metadata['total_cpu_seconds'], metadata['wall_clock_seconds'])
+```
+
+`executor` is `None` or `1` for a plain serial loop, an int for that many joblib
+worker processes, or an `Executor` (`SerialExecutor`, `JoblibExecutor`) when you
+want to set the backend or the batch size yourself.
+
+An executor holds its workers open across calls, so reversing several layers costs
+one pool startup rather than one per layer. Own it for the length of the run and
+hand the workers back at the end:
+
+```python
+from lat_space_lens import JoblibExecutor
+
+with JoblibExecutor(n_jobs=8) as executor:
+    for W, b in layers:
+        region_dicts = reverse_relu_layer(regions, W, b, executor=executor)
+        regions = flatten_layer(region_dicts, substitute)
+```
+
+Passing a bare int instead is fine, but it leaves joblib's worker pool up between
+calls (deliberately -- that is what makes the next call cheap), so call
+`shutdown_workers()` before a long script exits. A pool still running when CPython
+3.12 starts tearing the interpreter down is what produces
+
+```
+Exception ignored in: <function ResourceTracker.__del__ ...>
+ChildProcessError: [Errno 10] No child processes
+```
+
+That message is shutdown noise from a known CPython 3.12 regression
+([python/cpython#88887](https://github.com/python/cpython/issues/88887)): it is
+raised inside a finalizer, so the interpreter swallows it, the exit status is
+unaffected, and it is printed after every result has been returned and written.
+
+Because it is raised in a finalizer, no `try` block of yours can reach it. So
+closing the executor does what that finalizer would have done later, at a moment
+when an error is an ordinary catchable one: once the workers are down it stops the
+resource tracker itself, leaving the finalizer with nothing to wait on and nothing
+to raise. Nothing is patched and nothing is permanently gone -- the next code that
+needs a tracker gets a fresh one. `stop_resource_tracker()` is that step on its own.
+
+The order is the whole trick: every worker holds a duplicate of the tracker's pipe,
+so stopping the tracker with workers still running would wait forever. Stop the
+pool first, which is what `close()` and `shutdown_workers()` do.
+
+The split is over regions and not over a single region's orthants. The pruned
+search is greedy: it accumulates the maximal orthants it has found to be empty
+and tests every later orthant against them before building a linear program. Split
+that across processes and you either pay to synchronise the set on every orthant or
+let each worker rediscover what the others already pruned. Regions share no such
+state, so splitting on them keeps the pruning exactly as it was, and the regions
+that come back are identical to the serial ones rather than merely equivalent.
+
+
+`reverse_relu_helper(region, W, b)` is the older, hand-rolled form of the same
+idea: the top-level (picklable) `reverse_relu` + flatten, for use with
+`ProcessPoolExecutor.map`. It is kept for callers that already use it; new code
+should prefer `reverse_relu_layer`, which prunes and reports metadata.
 
 ## The Math
 

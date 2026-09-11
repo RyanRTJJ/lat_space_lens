@@ -22,6 +22,9 @@ from constants import M_16_10_PROBE
 from constants import M_16_10_W_hh
 from constants import M_16_10_W_hi
 from lat_space_lens import ConstraintSet
+from lat_space_lens import flatten_layer
+from lat_space_lens import reverse_relu_layer
+from lat_space_lens import resolve_executor
 
 # figures_16_10.py substitutes this for the probe threshold, because the probe is
 # fitted with a hard-coded intercept of 0.0 and the region would otherwise be
@@ -256,6 +259,188 @@ def test_reverse_relu_with_pruning_matches_exhaustive_at_layer_0(trunc_dim: Lite
 
 
 # ---------------------------------------------------------------------------
+# Spreading a layer's regions over workers
+#
+# reverse_relu_layer splits on regions rather than on orthants, so a region's
+# pruned search never straddles two workers and its greedy `max_infeas` is never
+# shared. That is what makes the parallel answer identical to the serial one
+# rather than merely equivalent, and it is what these check: same orthants, same
+# constraints, and the same number of verifier calls, which would move if a worker
+# had lost prunes another worker found.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('trunc_dim', [4, 5])
+def test_reverse_relu_layer_serial_matches_the_method(trunc_dim: Literal[4] | Literal[5]):
+    """With no executor it is the list comprehension it replaces."""
+    W_hi, _, no_bias, _, layer_1_regions = _pipeline(trunc_dim)
+
+    expected = [
+        region.reverse_relu_with_pruning(W_hi, no_bias)
+        for region in layer_1_regions
+    ]
+    actual = reverse_relu_layer(layer_1_regions, W_hi, no_bias)
+
+    assert len(actual) == len(expected)
+    for i, (expected_dict, actual_dict) in enumerate(zip(expected, actual)):
+        _assert_same_regions(expected_dict, actual_dict, f'region {i}')
+
+
+@pytest.mark.parametrize('pruning', [True, False])
+def test_reverse_relu_layer_parallel_matches_serial(pruning: bool):
+    """Two processes return what one process did, region for region and in order."""
+    trunc_dim = 5
+    W_hi, _, no_bias, _, layer_1_regions = _pipeline(trunc_dim)
+
+    serial, serial_metadata = reverse_relu_layer(
+        layer_1_regions, W_hi, no_bias, pruning=pruning, return_metadata=True
+    )
+    parallel, parallel_metadata = reverse_relu_layer(
+        layer_1_regions, W_hi, no_bias, pruning=pruning, executor=2,
+        return_metadata=True,
+    )
+
+    assert serial_metadata['num_workers'] == 1
+    assert parallel_metadata['num_workers'] == 2
+    for i, (serial_dict, parallel_dict) in enumerate(zip(serial, parallel)):
+        _assert_same_regions(serial_dict, parallel_dict, f'region {i}')
+
+    # The counters, unlike the seconds, are a property of the search and not of
+    # the machine. Pruning that had been lost by splitting a region's search
+    # across workers would show up here as extra verifier calls.
+    for counter in ('num_regions', 'num_total_regimes'):
+        assert parallel_metadata[counter] == serial_metadata[counter]
+    if pruning:
+        assert parallel_metadata['num_verifier_calls'] == \
+            serial_metadata['num_verifier_calls']
+
+
+def test_reverse_relu_layer_metadata_aggregates():
+    """The aggregate is the sum of the parts, and says how many parts there were."""
+    trunc_dim = 4
+    W_hi, _, no_bias, _, layer_1_regions = _pipeline(trunc_dim)
+
+    parts = [
+        region.reverse_relu_with_pruning(W_hi, no_bias, return_metadata=True)[1]
+        for region in layer_1_regions
+    ]
+    _, aggregate = reverse_relu_layer(
+        layer_1_regions, W_hi, no_bias, return_metadata=True
+    )
+
+    assert aggregate['num_regions_in'] == len(layer_1_regions)
+    for counter in ('num_regions', 'num_total_regimes', 'num_verifier_calls'):
+        assert aggregate[counter] == sum(part[counter] for part in parts)
+    assert aggregate['wall_clock_seconds'] >= 0.
+
+
+def test_flatten_layer_applies_the_substitution():
+    """flatten_layer is flatten_region_dicts over a whole layer, plus substitution."""
+    trunc_dim = 4
+    W_hi, _, no_bias, _, layer_1_regions = _pipeline(trunc_dim)
+
+    region_dicts = reverse_relu_layer(layer_1_regions, W_hi, no_bias)
+    expected = [
+        region
+        for region_dict in region_dicts
+        for region in region_dict.values()
+    ]
+
+    assert flatten_layer(region_dicts) == expected
+
+    substituted = flatten_layer(
+        region_dicts, lambda region: region.reverse_up_proj(W_hi, no_bias)
+    )
+    assert len(substituted) == len(expected)
+    for region, pre_activation_region in zip(substituted, expected):
+        assert np.array_equal(
+            region.A, pre_activation_region.reverse_up_proj(W_hi, no_bias).A
+        )
+
+
+def test_executor_close_shuts_the_workers_down():
+    """close() must actually reap the processes, not just drop joblib's handle.
+
+    joblib keeps its loky workers warm between calls on purpose, so releasing
+    Parallel leaves them running. Workers still up when the interpreter starts
+    tearing down are what provokes the ChildProcessError traceback CPython 3.12
+    prints from ResourceTracker.__del__, which is the whole reason close() exists.
+    """
+    from joblib.externals.loky import get_reusable_executor
+
+    from lat_space_lens import JoblibExecutor, shutdown_workers
+
+    def num_alive():
+        processes = getattr(get_reusable_executor(reuse=True), '_processes', None)
+        return sum(process.is_alive() for process in (processes or {}).values())
+
+    with JoblibExecutor(n_jobs=2) as executor:
+        executor.map(abs, [-1, -2, -3])
+        assert num_alive() > 0
+    assert num_alive() == 0
+
+    # Idempotent, and not final: mapping again brings a pool back up.
+    executor.close()
+    assert executor.map(abs, [-4]) == [4]
+    assert num_alive() > 0
+    shutdown_workers()
+    assert num_alive() == 0
+    shutdown_workers()
+
+
+def test_closing_stops_the_resource_tracker():
+    """close() must leave multiprocessing's resource tracker stopped.
+
+    CPython 3.12's ResourceTracker.__del__ waits on the tracker child and prints an
+    uncatchable ChildProcessError traceback at interpreter shutdown when that child
+    is already gone. The finalizer returns early when _fd and _pid are None, so
+    stopping the tracker while the workers are down -- where an error is an ordinary
+    catchable one -- is what keeps it quiet. See parallel.stop_resource_tracker.
+    """
+    from multiprocessing import resource_tracker
+
+    from lat_space_lens import JoblibExecutor, stop_resource_tracker
+
+    tracker = resource_tracker._resource_tracker
+
+    with JoblibExecutor(n_jobs=2) as executor:
+        assert executor.map(abs, [-1, -2, -3]) == [1, 2, 3]
+        # Spawning the pool is what starts the tracker, so this is the state the
+        # finalizer would later trip over.
+        assert tracker._fd is not None and tracker._pid is not None
+    assert tracker._fd is None and tracker._pid is None
+
+    # Which is exactly the state the finalizer returns early on, so running it
+    # by hand raises nothing.
+    type(tracker).__del__(tracker)
+
+    # Nothing is permanently gone: more parallel work starts a tracker again.
+    assert executor.map(abs, [-4]) == [4]
+    assert tracker._pid is not None
+    executor.close()
+    assert tracker._pid is None
+
+    # And with none running there is nothing to stop, said plainly rather than raised.
+    assert stop_resource_tracker() is False
+
+
+def test_resolve_executor():
+    """None and 1 mean the serial loop itself, not a one-worker pool."""
+    from lat_space_lens import JoblibExecutor, SerialExecutor, resolve_executor
+
+    assert isinstance(resolve_executor(None), SerialExecutor)
+    assert isinstance(resolve_executor(1), SerialExecutor)
+
+    executor = resolve_executor(3)
+    assert isinstance(executor, JoblibExecutor)
+    assert executor.num_workers == 3
+
+    assert resolve_executor(executor) is executor
+    with pytest.raises(TypeError):
+        resolve_executor('4')
+
+
+# ---------------------------------------------------------------------------
 # Timing, run from the terminal rather than under pytest
 # ---------------------------------------------------------------------------
 
@@ -267,21 +452,35 @@ def _print_timing_row(
           f'{speedup:>7.2f}x {regimes:>8} {calls:>7} {regions:>8}')
 
 
-def short_timing_report(trunc_dims=(9, 10), skip_exhaustive=False):
+def short_timing_report(trunc_dims=(9, 10), skip_exhaustive=False, executor=None):
     """Print exhaustive against pruned wall clock, taken from return_metadata.
 
     This asserts nothing and pytest does not collect it, because its numbers depend
-    on the machine and on what else is running. The times are the 'total_time_taken'
-    the two methods report, which covers the orthant loop only and excludes setup.
-    Layer 0 is summed over every region that layer 1 produced.
+    on the machine and on what else is running. The times are the summed
+    'total_time_taken' the two methods report, which covers the orthant loop only
+    and excludes setup. Layer 0 is summed over every region that layer 1 produced,
+    and its regions are spread over `executor` -- see reverse_relu_layer. Layer 1
+    starts from a single region, so there is nothing there to spread.
 
     'regions' counts the calls that produced a region rather than None. Pruned and
     exhaustive return the same regions, so it is read off the pruned run, which is
     the one that always happens.
+
+    @param executor:    None or 1 for a serial loop, an int for that many joblib
+                        workers, or a lat_space_lens Executor
     """
     print(f'{"trunc":>5} {"layer":>5} {"exhaustive s":>13} {"pruned s":>10} '
           f'{"speedup":>8} {"regimes":>8} {"calls":>7} {"regions":>8}')
 
+    # Resolved once and closed at the end, so the workers are started once for the
+    # whole report rather than per layer, and are gone before the interpreter
+    # exits. See Executor.close.
+    executor = resolve_executor(executor)
+    with executor:
+        _short_timing_rows(trunc_dims, skip_exhaustive, executor)
+
+
+def _short_timing_rows(trunc_dims, skip_exhaustive, executor):
     for trunc_dim in trunc_dims:
         W_hi, W_hh_hi, no_bias, root, layer_1_regions = _pipeline(trunc_dim)
 
@@ -298,21 +497,25 @@ def short_timing_report(trunc_dims=(9, 10), skip_exhaustive=False):
             pruned['num_regions'],
         )
 
-        exhaustive_seconds = pruned_seconds = 0.0
-        regimes = calls = regions = 0
-        for region in layer_1_regions:
-            if not skip_exhaustive:
-                _, exhaustive = region.reverse_relu(W_hi, no_bias, return_metadata=True)
-                exhaustive_seconds += exhaustive['total_time_taken']
-            _, pruned = region.reverse_relu_with_pruning(
-                W_hi, no_bias, return_metadata=True
+        exhaustive_seconds = 0.0
+        if not skip_exhaustive:
+            _, exhaustive = reverse_relu_layer(
+                layer_1_regions, W_hi, no_bias, pruning=False, executor=executor,
+                return_metadata=True,
             )
-            pruned_seconds += pruned['total_time_taken']
-            regimes += pruned['num_total_regimes']
-            calls += pruned['num_verifier_calls']
-            regions += pruned['num_regions']
+            exhaustive_seconds = exhaustive['total_cpu_seconds']
+        _, pruned = reverse_relu_layer(
+            layer_1_regions, W_hi, no_bias, pruning=True, executor=executor,
+            return_metadata=True,
+        )
         _print_timing_row(
-            trunc_dim, 0, exhaustive_seconds, pruned_seconds, regimes, calls, regions
+            trunc_dim,
+            0,
+            exhaustive_seconds,
+            pruned['total_cpu_seconds'],
+            pruned['num_total_regimes'],
+            pruned['num_verifier_calls'],
+            pruned['num_regions'],
         )
 
 
@@ -440,6 +643,7 @@ def _reverse_one_layer(
         skip_exhaustive,
         test_equality=False,
         context='',
+        executor=None,
     ):
     """Reverse one ReLU layer over every region, exhaustive against pruned.
 
@@ -452,46 +656,68 @@ def _reverse_one_layer(
     `test_equality` that sameness stops being an assumption and is checked on
     every region, which needs the exhaustive run and so rules out
     `skip_exhaustive`.
+
+    Both searches go through reverse_relu_layer, which spreads the regions over
+    `executor`. Each region's pruned search still runs whole inside one worker,
+    so the regions that come back do not depend on how many workers there were;
+    the timings do. See lat_space_lens/parallel.py.
+
+    @param executor:    None or 1 for a serial loop, an int for that many joblib
+                        workers, or an Executor
     """
     assert not (test_equality and skip_exhaustive), \
         'test_equality needs the exhaustive regions to compare against'
 
     exhaustive_seconds = pruned_seconds = 0.
-    regimes = calls = num_regions = 0
-    next_regions = []
-    for region in regions:
-        exhaustive_region_dict = None
-        if not skip_exhaustive:
-            exhaustive_region_dict, exhaustive = region.reverse_relu(
-                W, no_bias, return_metadata=True
-            )
-            exhaustive_seconds += exhaustive['total_time_taken']
-        pre_activation_region_dict, pruned = region.reverse_relu_with_pruning(
-            W, no_bias, return_metadata=True
+    exhaustive_wall_seconds = pruned_wall_seconds = 0.
+    exhaustive_region_dicts = None
+    if not skip_exhaustive:
+        exhaustive_region_dicts, exhaustive = reverse_relu_layer(
+            regions, W, no_bias, pruning=False, executor=executor,
+            return_metadata=True,
         )
-        if test_equality:
+        exhaustive_seconds = exhaustive['total_cpu_seconds']
+        exhaustive_wall_seconds = exhaustive['wall_clock_seconds']
+
+    pre_activation_region_dicts, pruned = reverse_relu_layer(
+        regions, W, no_bias, pruning=True, executor=executor,
+        return_metadata=True,
+    )
+    pruned_seconds = pruned['total_cpu_seconds']
+    pruned_wall_seconds = pruned['wall_clock_seconds']
+
+    if test_equality:
+        for exhaustive_region_dict, pre_activation_region_dict in zip(
+                exhaustive_region_dicts, pre_activation_region_dicts):
             _assert_same_regions(
                 exhaustive_region_dict, pre_activation_region_dict, context
             )
-        pruned_seconds += pruned['total_time_taken']
-        regimes += pruned['num_total_regimes']
-        calls += pruned['num_verifier_calls']
-        num_regions += pruned['num_regions']
-        for pre_activation_region in pre_activation_region_dict.values():
-            next_regions.append(substitute(pre_activation_region))
+
+    next_regions = flatten_layer(pre_activation_region_dicts, substitute)
 
     row = {
         'regions_in': len(regions),
         'exhaustive_seconds': exhaustive_seconds,
         'pruned_seconds': pruned_seconds,
-        'num_total_regimes': regimes,
-        'num_verifier_calls': calls,
-        'num_regions': num_regions,
+        'exhaustive_wall_seconds': exhaustive_wall_seconds,
+        'pruned_wall_seconds': pruned_wall_seconds,
+        'num_workers': pruned['num_workers'],
+        'num_total_regimes': pruned['num_total_regimes'],
+        'num_verifier_calls': pruned['num_verifier_calls'],
+        'num_regions': pruned['num_regions'],
     }
     return next_regions, row
 
 
 def _print_full_timing_row(triplet, layer, row):
+    """One line of the report.
+
+    'pruned s' is the summed cost of the searches and 'wall s' is what the layer
+    actually took, so with one worker they are about equal and with several the
+    gap between them is what the executor bought. The speedup column stays the
+    ratio of the two searches' cost, which is what pruning bought, so that a run
+    on many workers is still comparable with a serial one.
+    """
     model_seq_len, model_dim, start_dim_idx = triplet
     pruned_seconds = row['pruned_seconds']
     speedup = (
@@ -501,6 +727,7 @@ def _print_full_timing_row(triplet, layer, row):
     print(f"{model_seq_len:>4} {model_dim:>4} {start_dim_idx:>6} {layer:>6} "
           f"{row['regions_in']:>8} {row['exhaustive_seconds']:>13.4f} "
           f"{pruned_seconds:>10.4f} {speedup:>7.2f}x "
+          f"{row['pruned_wall_seconds']:>8.4f} {row['num_workers']:>7} "
           f"{row['num_total_regimes']:>9} {row['num_verifier_calls']:>8} "
           f"{row['num_regions']:>8}")
 
@@ -512,6 +739,7 @@ def full_timing_report(
         seed=42,
         skip_exhaustive=False,
         test_equality: bool = False,
+        executor=None,
         save_to=None,
     ):
     """short_timing_report over submatrices sampled from every model in the zoo.
@@ -554,6 +782,11 @@ def full_timing_report(
                             on the first disagreement. Needs the exhaustive
                             regions, so it cannot be combined with
                             `skip_exhaustive`
+    @param executor:        how to spread each layer's regions over workers:
+                            None or 1 for a serial loop, an int for that many
+                            joblib workers, or a lat_space_lens Executor. The
+                            regions that come back do not depend on this, only
+                            the wall clock does
     @param save_to:         where to write the JSON record, which holds the
                             arguments, the sampled triplets and every row.
                             Defaults to a name built from the arguments, in the
@@ -589,12 +822,44 @@ def full_timing_report(
     save_to = Path(save_to)
 
     print(f'seq_len={seq_len} dim={dim} n={n} seed={seed} '
-          f'skip_exhaustive={skip_exhaustive} test_equality={test_equality}')
+          f'skip_exhaustive={skip_exhaustive} test_equality={test_equality} '
+          f'executor={executor}')
     print(f'sampled {n} of {len(triplets)} eligible submatrices: {sampled}')
     print(f'{"mseq":>4} {"mdim":>4} {"start":>6} {"layer":>6} {"regions in":>8} '
           f'{"exhaustive s":>13} {"pruned s":>10} {"speedup":>8} '
+          f'{"wall s":>8} {"workers":>7} '
           f'{"regimes":>9} {"calls":>8} {"regions":>8}')
 
+    # Resolved once and closed at the end, so the workers are started once for the
+    # whole report rather than per layer of every triplet, and are gone before the
+    # interpreter exits. See Executor.close.
+    executor = resolve_executor(executor)
+    with executor:
+        rows = _full_timing_rows(
+            sampled, seq_len, dim, skip_exhaustive, test_equality, executor
+        )
+
+    record = {
+        'seq_len': seq_len,
+        'dim': dim,
+        'n': n,
+        'seed': seed,
+        'skip_exhaustive': skip_exhaustive,
+        'test_equality': test_equality,
+        'executor': repr(executor),
+        'num_eligible_triplets': len(triplets),
+        'sampled_triplets': [list(triplet) for triplet in sampled],
+        'rows': rows,
+    }
+    save_to.parent.mkdir(parents=True, exist_ok=True)
+    with open(save_to, 'w') as f:
+        json.dump(record, f, indent=2)
+    print(f'\nwrote {save_to}')
+    return save_to
+
+
+def _full_timing_rows(sampled, seq_len, dim, skip_exhaustive, test_equality, executor):
+    """The body of full_timing_report's loop, one row per triplet per layer."""
     rows = []
     for triplet in sampled:
         W_hi, W_hh, W_hh_hi, no_bias, root = _truncated_weights(
@@ -615,6 +880,7 @@ def full_timing_report(
                 skip_exhaustive,
                 test_equality=test_equality,
                 context=f'{triplet} layer {layer}',
+                executor=executor,
             )
             _print_full_timing_row(triplet, layer, row)
             rows.append({
@@ -637,6 +903,7 @@ def full_timing_report(
             skip_exhaustive,
             test_equality=test_equality,
             context=f'{triplet} layer 0',
+            executor=executor,
         )
         _print_full_timing_row(triplet, 0, row)
         rows.append({
@@ -646,23 +913,7 @@ def full_timing_report(
             'layer': 0,
             **row,
         })
-
-    record = {
-        'seq_len': seq_len,
-        'dim': dim,
-        'n': n,
-        'seed': seed,
-        'skip_exhaustive': skip_exhaustive,
-        'test_equality': test_equality,
-        'num_eligible_triplets': len(triplets),
-        'sampled_triplets': [list(triplet) for triplet in sampled],
-        'rows': rows,
-    }
-    save_to.parent.mkdir(parents=True, exist_ok=True)
-    with open(save_to, 'w') as f:
-        json.dump(record, f, indent=2)
-    print(f'\nwrote {save_to}')
-    return save_to
+    return rows
 
 
 def _mean_and_ci_half_width(values, confidence):
@@ -837,12 +1088,17 @@ def analyze_full_timing_report(report_path, save_to=None, confidence=0.95):
 
 if __name__ == '__main__':
     # short_timing_report()
-    full_timing_report(
-        seq_len=4,
-        dim=6,
-        n=5,
-        seed=44,
-        skip_exhaustive=False,
-        test_equality=False,
-    )
-    # analyze_full_timing_report('full_timing_report_seq4_dim4_n5_seed42.json')
+    # full_timing_report(
+    #     seq_len=4,
+    #     dim=6,
+    #     n=5,
+    #     seed=42,
+    #     skip_exhaustive=False,
+    #     test_equality=False,
+    #     # None or 1 for a serial loop, an int for that many worker processes.
+    #     # Only the first layer of a report is one region wide, so anything past
+    #     # it has plenty to spread; that first layer pays the pool startup for
+    #     # nothing, which is why its wall clock can exceed its cpu seconds.
+    #     executor=-1,
+    # )
+    analyze_full_timing_report('full_timing_report_seq4_dim6_n5_seed42.json')

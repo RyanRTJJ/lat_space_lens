@@ -927,11 +927,15 @@ class ConstraintSet:
             return_metadata: bool = False,
     ) -> dict[tuple, 'ConstraintSet'] | tuple[dict[tuple, 'ConstraintSet'], dict]:
         """
-        NOTE:           This function is to be run when you can run reverse_relu on a single
-                        machine only. Usually this means that relu_dim is <= 16. For parallel
-                        reverse_relu, map reverse_relu_for_Z_tuple for all Z_tuples over
-                        multiple cores / machines. View reverse_relu_orchestrator.py and
-                        worker.py as an example.
+        NOTE:           This walks every one of the 2 ** relu_dim orthants, which is
+                        practical up to relu_dim around 16. reverse_relu_with_pruning
+                        skips whole families of them and returns the same regions.
+
+                        To spread a whole LAYER over cores, hand its regions to
+                        parallel.reverse_relu_layer, which runs one call of this
+                        method per worker. Splitting a SINGLE call's orthants over
+                        workers is not what to do: see the header of parallel.py for
+                        why that costs more pruning than it buys.
 
         You have (math convention):
         -   post-up-proj + relu:        h = ReLU(W @ x + b)
@@ -1033,6 +1037,11 @@ class ConstraintSet:
         image prunes as large a family as possible. It walks a spanning tree in which
         the parent of an orthant is obtained by moving its lowest-numbered zeroed dim
         back into F, so every orthant has exactly one parent and is reached once.
+
+        The search is greedy and stateful -- `max_infeas` grows as orthants come back
+        empty and every later orthant is checked against it first -- so it belongs to
+        one worker. Parallelism goes one level up, over the regions of a layer, via
+        parallel.reverse_relu_layer. See the header of parallel.py.
 
         @param W:       shape (big, small) the up_projection matrix
 
