@@ -241,6 +241,105 @@ let each worker rediscover what the others already pruned. Regions share no such
 state, so splitting on them keeps the pruning exactly as it was, and the regions
 that come back are identical to the serial ones rather than merely equivalent.
 
+### Reversing layers over many machines
+
+<p align="center">
+  <img src="figures/distributed_architecture.svg"
+       alt="What a distributed run writes to storage, and the run that fills it" width="900">
+</p>
+
+`lat_space_lens.distributed` runs the same pruned search as `reverse_relu_layer`,
+but keeps all of its progress in storage (a local directory or a `gs://` bucket)
+so that any worker, or the driver itself, can be killed and the run picked up
+again. For `gs://` roots, install the extra: `pip install "lat-space-lens[gcs]"`.
+
+```python
+from lat_space_lens import LayerSpec, LocalProcessBackend, distributed
+
+layers = [
+    LayerSpec(W_hh_hi, no_bias, lambda r: r.reverse_add_up_proj(W_hh, W_hi, no_bias)),
+    LayerSpec(W_hi, no_bias, lambda r: r.reverse_up_proj(W_hi, no_bias)),
+]
+regions, metadatas = distributed.run(
+    'runs/run_001',                     # or 'gs://bucket/runs/run_001'
+    [start_region],
+    layers,
+    backend=LocalProcessBackend(n_procs=8),
+    return_metadata=True,
+)
+```
+
+Calling `run` again with the same arguments carries on from whatever is in
+storage. The result is identical to reversing the same layers with
+`reverse_relu_layer` and `flatten_layer`, and so are the search counters.
+
+For each layer, in the order given (`layer_000` is the first one reversed):
+
+1. **Plan.** The driver shuffles the layer's input regions into shards and writes
+
+   ```
+   <root>/layer_000/weights.pkl                 {'W', 'bias'}
+   <root>/layer_000/inputs/shard_000042.pkl     [(region_index, ConstraintSet), ...]
+   <root>/layer_000/layer.json                  num_shards, num_regions, weights hash
+   ```
+
+   `layer.json` is written last. If it already exists, planning is skipped, after
+   checking that W and bias match.
+
+2. **Run.** The backend runs one task per unfinished shard:
+
+   ```bash
+   python -m lat_space_lens.worker --run <root> --layer 0 --task-index 42
+   ```
+
+   `--task-index` defaults to `$BATCH_TASK_INDEX`, which Google Cloud Batch sets.
+   The worker goes through the shard's regions. For each region it runs
+   `PrunedReverseReluSearch` in windows of `--checkpoint-seconds` (default 60),
+   and after each window:
+
+   - if the window found any regions, writes them to
+     `tasks/shard_000042/chunk_<num_chunks>.pkl` as
+     `{'region_i': ..., 'regions': {zeroed_dim_idxs: ConstraintSet}}`;
+   - then writes `tasks/shard_000042/state.json`:
+
+   ```json
+   {
+     "region_i": 3,
+     "num_chunks": 7,
+     "done": false,
+     "search": {"frontier": [...], "frontier_pos": 17, "next_frontier": [...],
+                "max_infeas": [...], "counters": {...}},
+     "metadata": {...}
+   }
+   ```
+
+   `search` holds the loop variables of the pruned search, and that is all a
+   restarted worker needs to continue from the same orthant. `num_chunks` is how
+   many chunks are committed and the name of the next one. A worker killed after
+   writing a chunk but before writing `state.json` reruns that window and
+   overwrites the same chunk name, so nothing is duplicated.
+
+3. **Gather.** When every `state.json` says `done`, the driver reads chunks
+   `0 .. num_chunks - 1` of each shard, puts the results back in region order,
+   applies the layer's substitution, and writes `<root>/layer_000/output.pkl`. If
+   that file exists on a later call, the layer is skipped.
+
+`LocalProcessBackend` runs the tasks as subprocesses on this machine and restarts
+any that exit non-zero. A backend is anything with a `num_slots` property and a
+`run_tasks(root, layer, task_indices)` method that returns once those tasks have
+ended.
+
+`PrunedReverseReluSearch` can also be used on its own:
+
+```python
+from lat_space_lens import PrunedReverseReluSearch
+
+search = PrunedReverseReluSearch(region, W, b)
+found = search.step(budget_seconds=60)      # regions found in this window
+checkpoint = search.checkpoint()            # JSON-serialisable
+search = PrunedReverseReluSearch.resume(region, W, b, checkpoint)
+```
+
 
 `reverse_relu_helper(region, W, b)` is the older, hand-rolled form of the same
 idea: the top-level (picklable) `reverse_relu` + flatten, for use with
